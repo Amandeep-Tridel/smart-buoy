@@ -1,0 +1,26 @@
+services:
+  smart-buoy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smart-buoy:latest
+    container_name: smart-buoy-platform
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PORT=8000
+      - YOLO_CONFIG_DIR=/tmp/Ultralytics
+      - MPLCONFIGDIR=/tmp/matplotlib
+    volumes:
+      - ./data:/app/data
+      - ./weights:/app/weights:ro
+      - ./samples:/app/samples:ro
+      - ./assets:/app/assets:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s

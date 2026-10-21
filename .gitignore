@@ -4,5 +4,7 @@ __pycache__/
 Smart_Buoy_output.ipynb
 runs/
 smart_buoy_outputs/
-*.pt
+/*.pt
+!weights/*.pt
 .DS_Store
+.pytest_cache/

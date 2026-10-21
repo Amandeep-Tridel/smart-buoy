@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Buoy AI Command Center — NOAA Telemetry &amp; YOLOv11m Marine Vision</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon" aria-hidden="true">🌊</div>
+      <div>
+        <h1>SMART BUOY AI COMMAND CENTER</h1>
+        <p class="subtitle">Real-Time NOAA NDBC 46050 &amp; ACQS1 Telemetry • PyTorch H100 Wave Forecaster • YOLOv11m Marine Vision</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div class="ws-pill" id="ws-status" title="Real-time 2 Hz 6-DOF Buoy IMU WebSocket stream">
+        <span class="pulse-dot" id="ws-dot"></span>
+        <span id="ws-text">LIVE IMU 2Hz</span>
+      </div>
+      <div class="device-pill" id="compute-badge">H100 Weights Ready</div>
+      <button class="btn btn-outline" id="btn-refresh-noaa" type="button" title="Fetch latest real-time observations from NOAA NDBC servers">
+        ⟳ Sync Live NOAA
+      </button>
+      <a class="btn btn-primary" href="https://colab.research.google.com/drive/1dMjeZOfojmAeJRTV_f32L6bRwgLhDs3k" target="_blank" rel="noopener">
+        🚀 Open H100 Colab
+      </a>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Non-intrusive Status / Error Banner -->
+    <div id="status-banner" class="status-banner hidden" role="alert" aria-live="polite">
+      <div class="status-banner-content">
+        <span class="status-banner-icon" id="status-banner-icon">⚠️</span>
+        <span id="status-banner-text">System notification</span>
+      </div>
+      <button id="status-banner-close" class="banner-close" type="button" aria-label="Dismiss notification">&times;</button>
+    </div>
+
+    <!-- Top Live KPI Strip -->
+    <section class="kpi-grid" aria-label="Real-Time Maritime Telemetry Key Performance Indicators">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-label">SIGNIFICANT WAVE HEIGHT (H<sub>s</sub>)</span>
+          <span class="kpi-tag tag-blue">NOAA 46050</span>
+        </div>
+        <div class="kpi-value" id="kpi-hs">-- m</div>
+        <div class="kpi-sub" id="kpi-hs-forecast">1h AI Forecast: -- m (-- m)</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-label">WAVE PERIOD (T<sub>p</sub> / T<sub>a</sub>)</span>
+          <span class="kpi-tag tag-cyan">46-BAND SPECTRA</span>
+        </div>
+        <div class="kpi-value" id="kpi-tp">-- s</div>
+        <div class="kpi-sub" id="kpi-tp-forecast">1h AI Period Forecast: -- s</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-label">OFFSHORE WIND &amp; BAROMETER</span>
+          <span class="kpi-tag tag-emerald">MET-OCEAN</span>
+        </div>
+        <div class="kpi-value" id="kpi-wind">-- m/s</div>
+        <div class="kpi-sub" id="kpi-pres">Gust: -- m/s • Pressure: -- hPa</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-label">WATER QUALITY SONDE</span>
+          <span class="kpi-tag tag-purple" id="kpi-wq-badge">NOAA ACQS1</span>
+        </div>
+        <div class="kpi-value" id="kpi-wq">-- mg/L O₂</div>
+        <div class="kpi-sub" id="kpi-wq-sub">Turb: -- NTU • Sal: -- PSU • pH: --</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-label">LIVE 6-DOF BUOY IMU MOTION</span>
+          <span class="kpi-tag tag-amber" id="kpi-imu-time">STREAMING</span>
+        </div>
+        <div class="kpi-value mono" id="kpi-heave">+0.000 m</div>
+        <div class="kpi-sub mono" id="kpi-attitude">Roll: 0.0° • Pitch: 0.0°</div>
+      </div>
+    </section>
+
+    <!-- Section 1: YOLOv11m Marine Computer Vision & Radar Bearing HUD -->
+    <section class="panel vision-panel">
+      <div class="panel-header">
+        <div>
+          <h2>🎯 YOLOv11m Marine Computer Vision Studio &amp; Azimuth Radar HUD</h2>
+          <p class="panel-desc">Interactive inference across all 4 Marine Vision detection tracks + Multi-Model Ensemble Fusion trained on NVIDIA H100</p>
+        </div>
+        <div class="mode-tabs" id="vision-mode-tabs" role="tablist" aria-label="Marine Vision Detection Modes">
+          <button class="mode-tab active" type="button" data-mode="buoy">Type 1: Navigation Buoy (94.1% mAP)</button>
+          <button class="mode-tab" type="button" data-mode="colregs">Type 2: COLREGs Vessels (66.1% mAP)</button>
+          <button class="mode-tab" type="button" data-mode="sar">Type 3: SAR Swimmer (83.9% mAP)</button>
+          <button class="mode-tab" type="button" data-mode="horizon">Type 4: Horizon + 3-Zone Seg + HUD</button>
+          <button class="mode-tab mode-tab-ensemble" type="button" data-mode="ensemble">⚡ Type 5: Ensemble Fusion + HUD</button>
+        </div>
+      </div>
+
+      <!-- Sample selector & upload bar -->
+      <div class="vision-controls">
+        <div class="sample-strip" id="sample-strip">
+          <!-- Populated dynamically from /api/vision/samples -->
+        </div>
+        <div class="upload-controls">
+          <span class="upload-source-badge hidden" id="upload-source-badge" title="Currently inspecting custom uploaded image"></span>
+          <label class="conf-control" for="conf-slider">
+            <span>Conf: <strong id="conf-val" class="mono">0.25</strong></span>
+            <input type="range" id="conf-slider" min="0.05" max="0.90" step="0.05" value="0.25" />
+          </label>
+          <label class="btn btn-outline upload-btn">
+            📁 Upload Marine Image
+            <input type="file" id="image-upload" accept="image/*" hidden />
+          </label>
+        </div>
+      </div>
+
+      <!-- Main Vision Viewport + Radar Bearing HUD + Horizon Gyro -->
+      <div class="vision-workspace">
+        <div class="vision-viewport-wrap">
+          <div class="viewport-statusbar">
+            <span id="vision-model-title">Loading YOLOv11m model...</span>
+            <div class="viewport-meta">
+              <div class="zone-legend" id="zone-legend" title="Optical Horizon &amp; 3-Zone Segmentation Key">
+                <span class="legend-dot dot-sky"></span>Sky
+                <span class="legend-dot dot-water"></span>Water
+                <span class="legend-dot dot-horizon"></span>Horizon
+                <span class="legend-dot dot-target"></span>Target
+              </div>
+              <span class="mono perf-pill" id="vision-perf-badge">-- ms</span>
+            </div>
+          </div>
+          <div class="vision-canvas-box">
+            <img id="vision-output-img" alt="YOLOv11m Detection Output" src="" />
+            <div class="loading-overlay" id="vision-loading">
+              <div class="spinner"></div>
+              <span id="vision-loading-text">Running YOLOv11m Inference...</span>
+            </div>
+            <div class="error-overlay hidden" id="vision-error">
+              <div class="error-box">
+                <div class="error-title">⚠️ Vision Inference Error</div>
+                <p id="vision-error-msg">Unable to process the selected image.</p>
+                <button class="btn btn-outline" id="btn-vision-recover" type="button">Restore Default Sample</button>
+              </div>
+            </div>
+          </div>
+          <div class="benchmark-ribbon" id="vision-benchmark-ribbon">
+            <span>Dataset: <strong id="bm-dataset">--</strong></span>
+            <span>Precision: <strong id="bm-p">--%</strong></span>
+            <span>Recall: <strong id="bm-r">--%</strong></span>
+            <span>mAP@50: <strong id="bm-map50">--%</strong></span>
+            <span>mAP@50-95: <strong id="bm-map95">--%</strong></span>
+          </div>
+        </div>
+
+        <div class="vision-side-hud">
+          <div class="hud-widgets-row">
+            <div class="hud-box">
+              <h3>📡 Polar Azimuth Radar HUD (±45° FOV)</h3>
+              <canvas id="radar-canvas" width="240" height="200"></canvas>
+              <div class="attitude-metrics mono" id="radar-summary">
+                Targets: 0 | Closest: -- m
+              </div>
+            </div>
+            <div class="hud-box">
+              <h3>🧭 Optical Horizon Attitude &amp; Zones</h3>
+              <canvas id="horizon-canvas" width="240" height="145"></canvas>
+              <div class="attitude-metrics mono" id="optical-attitude-stats">
+                Roll: 0.0° | Pitch: 0.0% | Water: 50%
+              </div>
+            </div>
+          </div>
+
+          <div class="detections-box">
+            <div class="detections-header">
+              <h3>Detected Maritime Targets (<span id="det-count">0</span>)</h3>
+              <div class="det-header-right">
+                <span class="risk-pill risk-clear" id="colregs-status-pill">STATUS: CLEAR</span>
+                <span class="mono" id="det-res">-- × -- px</span>
+              </div>
+            </div>
+            <div class="colregs-advisory" id="colregs-advisory-bar">
+              All optical azimuth sectors clear. Maintain standard COLREGs Rule 5 look-out.
+            </div>
+            <div class="table-scroll">
+              <table class="det-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Class</th>
+                    <th>Conf</th>
+                    <th>Bearing</th>
+                    <th>Est. Range</th>
+                  </tr>
+                </thead>
+                <tbody id="det-tbody">
+                  <tr><td colspan="5" class="empty-row">Select a sample or upload an image</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 2: Wave Energy Spectra & H100 AI Forecasting Charts (2x2 Grid) -->
+    <section class="charts-grid">
+      <!-- Panel 1: 46-Band Wave Energy Density Spectrum S(f) vs JONSWAP -->
+      <div class="panel chart-panel">
+        <div class="panel-header-compact">
+          <div>
+            <h3>🌊 NOAA 46050: 46-Band Wave Energy Density Spectrum S(f) vs. JONSWAP</h3>
+            <p class="panel-sub" id="spec-subtitle">Spectral integration H<sub>m0</sub> = 4√m₀ correlation with buoy WVHT: r = 0.9977</p>
+          </div>
+          <div class="mini-tabs">
+            <button class="mini-tab active" type="button" data-spec-mode="peak">Peak Storm (3.85m)</button>
+            <button class="mini-tab" type="button" data-spec-mode="latest">Latest Burst</button>
+            <button class="mini-tab" type="button" data-spec-mode="compare">Compare Both</button>
+          </div>
+        </div>
+        <div class="metrics-strip mono" id="spec-moments-strip">
+          <span>H<sub>m0</sub>: <strong id="spec-hm0">-- m</strong></span>
+          <span>T<sub>p</sub>: <strong id="spec-tp">-- s</strong></span>
+          <span>T<sub>m01</sub>: <strong id="spec-tm01">-- s</strong></span>
+          <span>T<sub>m02</sub>: <strong id="spec-tm02">-- s</strong></span>
+          <span>Bandwidth ε: <strong id="spec-eps">--</strong></span>
+        </div>
+        <div class="chart-box">
+          <canvas id="chart-spectrum"></canvas>
+        </div>
+      </div>
+
+      <!-- Panel 2: Spectral Integration Validation Hm0 vs Reported WVHT -->
+      <div class="panel chart-panel">
+        <div class="panel-header-compact">
+          <div>
+            <h3>📈 Spectral Integration Validation: H<sub>m0</sub> = 4√m₀ vs. Reported WVHT</h3>
+            <p class="panel-sub" id="corr-subtitle">2,145 Real Spectral Bursts • Stonewall Bank Offshore Buoy (NOAA 46050)</p>
+          </div>
+          <div class="header-badges">
+            <div class="mini-tabs">
+              <button class="mini-tab active" type="button" data-corr-mode="height">H<sub>m0</sub> vs WVHT</button>
+              <button class="mini-tab" type="button" data-corr-mode="period">T<sub>p</sub> vs T<sub>m02</sub></button>
+            </div>
+            <span class="badge-metric" id="hm0-corr-badge">r = 0.9977</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <canvas id="chart-hm0-corr"></canvas>
+        </div>
+      </div>
+
+      <!-- Panel 3: H100 Residual BiLSTM+Attention Wave Forecast -->
+      <div class="panel chart-panel">
+        <div class="panel-header-compact">
+          <div>
+            <h3>🧠 H100 Residual BiLSTM+Attention: Sea-State Forecast</h3>
+            <p class="panel-sub" id="forecast-subtitle">6-Hour Lookback → 1-Hour Ahead Sea-State Prediction</p>
+          </div>
+          <div class="header-badges">
+            <div class="mini-tabs">
+              <button class="mini-tab active" type="button" data-fc-mode="hs">Wave Height (H<sub>s</sub>)</button>
+              <button class="mini-tab" type="button" data-fc-mode="apd">Wave Period (T<sub>a</sub>)</button>
+            </div>
+            <span class="badge-metric" id="forecast-r2-badge">R² = 0.8862 | MAE = 0.127m</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <canvas id="chart-wave-forecast"></canvas>
+        </div>
+      </div>
+
+      <!-- Panel 4: NOAA ACQS1 7-Channel Water Quality Sonde & LSTM Autoencoder Anomalies -->
+      <div class="panel chart-panel">
+        <div class="panel-header-compact">
+          <div>
+            <h3>🧪 NOAA ACQS1: 7-Channel Water Quality Sonde &amp; LSTM Autoencoder Anomalies</h3>
+            <p class="panel-sub" id="wq-anom-subtitle">Unsupervised detection of estuarine sediment/turbidity plumes &amp; hypoxic dips</p>
+          </div>
+          <div class="header-badges">
+            <div class="mini-tabs">
+              <button class="mini-tab active" type="button" data-wq-mode="turbidity">Turbidity (NTU)</button>
+              <button class="mini-tab" type="button" data-wq-mode="o2">Dissolved O₂</button>
+              <button class="mini-tab" type="button" data-wq-mode="mse">AE Recon MSE</button>
+            </div>
+            <span class="badge-metric badge-red" id="wq-anom-count">218 Flagged Events</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <canvas id="chart-wq-anomaly"></canvas>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

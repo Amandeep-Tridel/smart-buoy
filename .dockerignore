@@ -1,0 +1,47 @@
+# Version control & CI metadata
+.git/
+.github/
+.gitignore
+
+# Python bytecode & test/lint caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter notebooks & temporary execution outputs
+*.ipynb
+.ipynb_checkpoints/
+runs/
+smart_buoy_outputs/
+
+# Root-level scratch weights (keep production weights in weights/)
+/*.pt
+!weights/*.pt
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# Explicitly preserve required runtime directories and files
+!app/**
+!data/**
+!weights/**
+!samples/**
+!assets/**
+!tests/**
+!requirements.txt
+!README.md

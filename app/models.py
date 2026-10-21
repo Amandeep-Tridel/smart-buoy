@@ -40,14 +40,36 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def _ensure_clean_wq_df(df_wq: pd.DataFrame) -> pd.DataFrame:
     """Ensure WQ DataFrame has non-NaN numeric columns; repair from ACQS1.ocean if column shift occurred."""
-    if df_wq is not None and len(df_wq) > 0 and all(c in df_wq.columns for c in WQ_COLS):
-        num_wq = df_wq[WQ_COLS].apply(pd.to_numeric, errors="coerce")
+    if df_wq is not None and len(df_wq) > 0:
+        df_norm = df_wq.copy()
+        alias_map = {
+            "OTMP_c": ("WTMP_wq_c", "WTMP_c"),
+            "COND_mscm": ("COND_mScm",),
+        }
+        for target_col, aliases in alias_map.items():
+            if target_col not in df_norm.columns:
+                for alias in aliases:
+                    if alias in df_norm.columns:
+                        df_norm[target_col] = df_norm[alias]
+                        break
+        defaults = {
+            "OTMP_c": 14.0,
+            "COND_mscm": 45.0,
+            "SAL_psu": 32.0,
+            "O2_pct": 95.0,
+            "O2_ppm": 8.0,
+            "TURB_ntu": 5.0,
+            "PH": 8.0,
+        }
+        for col, default_val in defaults.items():
+            if col not in df_norm.columns:
+                df_norm[col] = default_val
+        num_wq = df_norm[WQ_COLS].apply(pd.to_numeric, errors="coerce")
         if not num_wq["TURB_ntu"].isna().all() and float(num_wq["PH"].max()) <= 14.5:
-            if not num_wq.isna().any().any():
+            if not num_wq.isna().any().any() and all(c in df_wq.columns for c in WQ_COLS):
                 return df_wq
-            df_fixed = df_wq.copy()
-            df_fixed[WQ_COLS] = num_wq.interpolate(method="linear", limit_direction="both").bfill().ffill().fillna(0.0)
-            return df_fixed
+            df_norm[WQ_COLS] = num_wq.interpolate(method="linear", limit_direction="both").bfill().ffill().fillna(0.0)
+            return df_norm
 
     wq_path = DATA_DIR / "ACQS1.ocean"
     if wq_path.exists():
@@ -545,7 +567,12 @@ class BuoyTimeSeriesEngine:
             },
         }
 
-        result["alerts"] = self.alert_engine.evaluate(store=store, forecast_payload=result)
+        result["alerts"] = self.alert_engine.evaluate(
+            store=store,
+            forecast_payload=result,
+            df_met=df_met,
+            df_wq=df_wq,
+        )
         self._cache_key = key
         self._cached_result = result
         return result

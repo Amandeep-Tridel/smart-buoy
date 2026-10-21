@@ -92,6 +92,21 @@
       </div>
     </section>
 
+    <!-- Maritime & Environmental Hazard Alert Strip -->
+    <section class="alerts-strip" id="maritime-alerts-strip" aria-label="Maritime and Environmental Hazard Advisories">
+      <div class="alerts-strip-left">
+        <span class="risk-pill risk-nominal" id="alerts-overall-pill">WATCH: NOMINAL</span>
+        <span class="alerts-summary-text" id="alerts-summary-text">Evaluating 5-domain NOAA maritime &amp; environmental hazard thresholds...</span>
+      </div>
+      <div class="alerts-domain-pills" id="alerts-domain-pills">
+        <span class="domain-pill" id="alert-domain-wave">Wave: --</span>
+        <span class="domain-pill" id="alert-domain-baro">Baro: --</span>
+        <span class="domain-pill" id="alert-domain-wind">Gust: --</span>
+        <span class="domain-pill" id="alert-domain-hypoxia">DO: --</span>
+        <span class="domain-pill" id="alert-domain-wq">Plume AE: --</span>
+      </div>
+    </section>
+
     <!-- Section 1: YOLOv11m Marine Computer Vision & Radar Bearing HUD -->
     <section class="panel vision-panel">
       <div class="panel-header">
@@ -224,9 +239,9 @@
             <p class="panel-sub" id="spec-subtitle">Spectral integration H<sub>m0</sub> = 4√m₀ correlation with buoy WVHT: r = 0.9977</p>
           </div>
           <div class="mini-tabs">
-            <button class="mini-tab active" type="button" data-spec-mode="peak">Peak Storm (3.85m)</button>
-            <button class="mini-tab" type="button" data-spec-mode="latest">Latest Burst</button>
-            <button class="mini-tab" type="button" data-spec-mode="compare">Compare Both</button>
+            <button class="mini-tab active" type="button" data-spec-mode="peak" id="btn-spec-peak">Peak Storm (3.85m)</button>
+            <button class="mini-tab" type="button" data-spec-mode="latest" id="btn-spec-latest">Latest Burst</button>
+            <button class="mini-tab" type="button" data-spec-mode="compare" id="btn-spec-compare">Compare Both</button>
           </div>
         </div>
         <div class="metrics-strip mono" id="spec-moments-strip">
@@ -256,6 +271,13 @@
             <span class="badge-metric" id="hm0-corr-badge">r = 0.9977</span>
           </div>
         </div>
+        <div class="metrics-strip mono" id="corr-metrics-strip">
+          <span>Sea State: <strong id="corr-wmo">--</strong></span>
+          <span>Steepness S<sub>p</sub>: <strong id="corr-steepness">--</strong></span>
+          <span>Rogue Risk: <strong id="corr-rogue">--</strong></span>
+          <span>BFI: <strong id="corr-bfi">--</strong></span>
+          <span>3h E[H<sub>max</sub>]: <strong id="corr-hmax">-- m</strong></span>
+        </div>
         <div class="chart-box">
           <canvas id="chart-hm0-corr"></canvas>
         </div>
@@ -266,7 +288,7 @@
         <div class="panel-header-compact">
           <div>
             <h3>🧠 H100 Residual BiLSTM+Attention: Sea-State Forecast</h3>
-            <p class="panel-sub" id="forecast-subtitle">6-Hour Lookback → 1-Hour Ahead Sea-State Prediction</p>
+            <p class="panel-sub" id="forecast-subtitle">6-Hour Lookback → 1-Hour Ahead Sea-State Prediction (95% MC Dropout CI)</p>
           </div>
           <div class="header-badges">
             <div class="mini-tabs">
@@ -275,6 +297,13 @@
             </div>
             <span class="badge-metric" id="forecast-r2-badge">R² = 0.8862 | MAE = 0.127m</span>
           </div>
+        </div>
+        <div class="metrics-strip mono" id="forecast-horizons-strip">
+          <span>+1h: <strong id="fc-h1">-- m</strong></span>
+          <span>+2h: <strong id="fc-h2">-- m</strong></span>
+          <span>+3h: <strong id="fc-h3">-- m</strong></span>
+          <span>+6h: <strong id="fc-h6">-- m</strong></span>
+          <span>95% CI: <strong id="fc-ci95">±-- m</strong></span>
         </div>
         <div class="chart-box">
           <canvas id="chart-wave-forecast"></canvas>
@@ -296,6 +325,13 @@
             </div>
             <span class="badge-metric badge-red" id="wq-anom-count">218 Flagged Events</span>
           </div>
+        </div>
+        <div class="metrics-strip mono" id="wq-metrics-strip">
+          <span>Latest MSE: <strong id="wq-latest-mse">--</strong></span>
+          <span>95% Thresh: <strong id="wq-thresh-mse">--</strong></span>
+          <span>Max MSE: <strong id="wq-max-mse">--</strong></span>
+          <span>Z-Score: <strong id="wq-zscore">--</strong></span>
+          <span>Hypoxic (&lt;2 mg/L): <strong id="wq-hypoxic-count">--</strong></span>
         </div>
         <div class="chart-box">
           <canvas id="chart-wq-anomaly"></canvas>

@@ -53,11 +53,15 @@ def format_nmea(sentence_body: str) -> str:
 
 def verify_nmea_sentence(sentence: str) -> bool:
     """Validate that an NMEA-0183 sentence starts with '$' and has a matching '*XX' XOR checksum."""
+    if not isinstance(sentence, str):
+        return False
     s = sentence.strip()
-    if not s.startswith("$") or "*" not in s:
+    if not s.startswith("$") or s.count("*") != 1:
         return False
     body, _, given_hex = s[1:].partition("*")
     if not body or len(given_hex) != 2:
+        return False
+    if not all(c in "0123456789ABCDEFabcdef" for c in given_hex):
         return False
     return nmea_checksum(body).upper() == given_hex.upper()
 
@@ -74,7 +78,7 @@ def build_gpzda(dt: Optional[datetime] = None) -> str:
     else:
         dt = dt.astimezone(timezone.utc)
 
-    centisec = int(round(dt.microsecond / 10000.0)) % 100
+    centisec = (dt.microsecond // 10000) % 100
     hms = f"{dt.hour:02d}{dt.minute:02d}{dt.second:02d}.{centisec:02d}"
     body = f"GPZDA,{hms},{dt.day:02d},{dt.month:02d},{dt.year:04d},00,00"
     return format_nmea(body)
@@ -91,11 +95,13 @@ def build_wimwv(
 
     Format: $WIMWV,x.x,R|T,x.x,M|N|K,A*CC
     """
-    ref = reference.upper() if reference.upper() in ("R", "T") else "R"
-    unit = units.upper() if units.upper() in ("M", "N", "K") else "M"
-    stat = status.upper() if status.upper() in ("A", "V") else "A"
-    angle = float(wind_dir_deg) % 360.0
-    speed = max(0.0, float(wind_speed_mps))
+    ref = reference.upper() if isinstance(reference, str) and reference.upper() in ("R", "T") else "R"
+    unit = units.upper() if isinstance(units, str) and units.upper() in ("M", "N", "K") else "M"
+    stat = status.upper() if isinstance(status, str) and status.upper() in ("A", "V") else "A"
+    raw_angle = float(wind_dir_deg)
+    angle = (raw_angle % 360.0) if math.isfinite(raw_angle) else 0.0
+    raw_speed = float(wind_speed_mps)
+    speed = max(0.0, raw_speed) if math.isfinite(raw_speed) else 0.0
     body = f"WIMWV,{angle:.1f},{ref},{speed:.2f},{unit},{stat}"
     return format_nmea(body)
 
@@ -105,7 +111,8 @@ def build_yxmtw(water_temp_c: float) -> str:
 
     Format: $YXMTW,x.x,C*CC
     """
-    temp = float(water_temp_c)
+    raw_temp = float(water_temp_c)
+    temp = raw_temp if math.isfinite(raw_temp) else 0.0
     body = f"YXMTW,{temp:.2f},C"
     return format_nmea(body)
 
@@ -133,39 +140,114 @@ class SmartBuoySimulator:
         self._start_monotonic = time.monotonic()
         self._step_counter = 0
 
-        assert self.store.freqs is not None and self.store.spec_matrix is not None
-        assert self.store.hm0_series is not None and self.store.tp_series is not None
-        assert self.store.df_met is not None and self.store.df_wq is not None
+        raw_freqs = (
+            np.asarray(self.store.freqs, dtype=np.float64)
+            if self.store.freqs is not None and len(self.store.freqs) > 0
+            else np.array([0.10], dtype=np.float64)
+        )
+        self.freqs: np.ndarray = raw_freqs
+        if len(self.freqs) >= 2:
+            self.df_bins: np.ndarray = np.gradient(self.freqs)
+        else:
+            self.df_bins = np.array([max(float(self.freqs[0]) * 0.1, 0.005)], dtype=np.float64)
 
-        self.freqs: np.ndarray = self.store.freqs.astype(np.float64)
-        self.df_bins: np.ndarray = np.gradient(self.freqs)
         self.omega: np.ndarray = 2.0 * math.pi * self.freqs
         # Deep-water linear dispersion relation: k = omega^2 / g
         self.wavenumbers: np.ndarray = (self.omega ** 2) / GRAVITY_MPS2
-        # Deterministic random initial phases across the 46 frequency bands
+        # Deterministic random initial phases across the frequency bands
         self.phases_heave: np.ndarray = self.rng.uniform(0.0, 2.0 * math.pi, size=len(self.freqs))
         self.phases_roll: np.ndarray = self.phases_heave + (math.pi / 2.0)
         self.phases_pitch: np.ndarray = self.rng.uniform(0.0, 2.0 * math.pi, size=len(self.freqs))
 
     def _select_spectrum_index(self, mode: Optional[str] = None) -> int:
-        assert self.store.hm0_series is not None
-        m = mode or self.mode
+        if self.store.hm0_series is None or len(self.store.hm0_series) == 0:
+            return 0
+        m = mode if mode in ("latest", "peak") else self.mode
         if m == "peak":
             return int(np.argmax(self.store.hm0_series))
         return len(self.store.hm0_series) - 1
 
-    def sample_imu_6dof(self, t_sec: Optional[float] = None, mode: Optional[str] = None) -> Dict[str, float]:
+    def _get_met_row(self, index: int = -1) -> Dict[str, Any]:
+        df_met = self.store.df_met
+        if df_met is not None and len(df_met) > 0:
+            idx = index if -len(df_met) <= index < len(df_met) else -1
+            row = df_met.iloc[idx]
+            ts = row["timestamp"]
+            ts_str = ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ts, "strftime") else str(ts)
+            return {
+                "timestamp_str": ts_str,
+                "WDIR_deg": float(row["WDIR_deg"]),
+                "WSPD_mps": float(row["WSPD_mps"]),
+                "GST_mps": float(row["GST_mps"]),
+                "WVHT_m": float(row["WVHT_m"]),
+                "DPD_s": float(row["DPD_s"]),
+                "APD_s": float(row["APD_s"]),
+                "PRES_hpa": float(row["PRES_hpa"]),
+            }
+        return {
+            "timestamp_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "WDIR_deg": 315.0,
+            "WSPD_mps": 6.0,
+            "GST_mps": 7.5,
+            "WVHT_m": 1.8,
+            "DPD_s": 10.0,
+            "APD_s": 7.5,
+            "PRES_hpa": 1015.0,
+        }
+
+    def _get_wq_row(self, index: int = -1) -> Dict[str, Any]:
+        df_wq = self.store.df_wq
+        if df_wq is not None and len(df_wq) > 0:
+            idx = index if -len(df_wq) <= index < len(df_wq) else -1
+            row = df_wq.iloc[idx]
+            ts = row["timestamp"]
+            ts_str = ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ts, "strftime") else str(ts)
+            return {
+                "timestamp_str": ts_str,
+                "OTMP_c": float(row["OTMP_c"]),
+                "COND_mscm": float(row["COND_mscm"]),
+                "SAL_psu": float(row["SAL_psu"]),
+                "O2_pct": float(row["O2_pct"]),
+                "O2_ppm": float(row["O2_ppm"]),
+                "TURB_ntu": float(row["TURB_ntu"]),
+                "PH": float(row["PH"]),
+            }
+        return {
+            "timestamp_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "OTMP_c": 14.5,
+            "COND_mscm": 48.0,
+            "SAL_psu": 31.5,
+            "O2_pct": 92.0,
+            "O2_ppm": 7.8,
+            "TURB_ntu": 4.5,
+            "PH": 7.9,
+        }
+
+    def sample_imu_6dof(
+        self,
+        t_sec: Optional[float] = None,
+        mode: Optional[str] = None,
+        index: int = -1,
+    ) -> Dict[str, float]:
         """Synthesize 6-DOF IMU buoy motion by superposing all 46 NOAA wave spectral bands."""
-        assert self.store.spec_matrix is not None and self.store.df_met is not None
         if t_sec is None:
             t_sec = time.monotonic() - self._start_monotonic
 
         spec_idx = self._select_spectrum_index(mode=mode)
-        s_f = np.maximum(self.store.spec_matrix[spec_idx], 0.0)
-        # Wave component amplitudes a_i = sqrt(2 * S(f_i) * df_i)
-        amps = np.sqrt(2.0 * s_f * self.df_bins)
+        if (
+            self.store.spec_matrix is not None
+            and len(self.store.spec_matrix) > spec_idx
+            and len(self.store.spec_matrix[spec_idx]) == len(self.freqs)
+        ):
+            s_f = np.maximum(np.asarray(self.store.spec_matrix[spec_idx], dtype=np.float64), 0.0)
+        else:
+            s_f = np.zeros_like(self.freqs)
 
-        wdir_deg = float(self.store.df_met.iloc[-1]["WDIR_deg"])
+        # Wave component amplitudes a_i = sqrt(2 * S(f_i) * df_i)
+        amps = np.sqrt(2.0 * s_f * np.maximum(self.df_bins, 1e-6))
+
+        met_row = self._get_met_row(index=index)
+        wdir_deg = float(met_row["WDIR_deg"])
         wave_dir_rad = math.radians(wdir_deg)
 
         phase_t = self.omega * float(t_sec) + self.phases_heave
@@ -216,15 +298,19 @@ class SmartBuoySimulator:
             "gyro_z_dps": round(gyro_z_dps, 3),
         }
 
-    def sample_gps(self, t_sec: Optional[float] = None, imu: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    def sample_gps(
+        self,
+        t_sec: Optional[float] = None,
+        imu: Optional[Dict[str, float]] = None,
+        index: int = -1,
+    ) -> Dict[str, Any]:
         """Synthesize GPS watch-circle mooring coordinates around NOAA Station 46050."""
-        assert self.store.df_met is not None
         if t_sec is None:
             t_sec = time.monotonic() - self._start_monotonic
         if imu is None:
-            imu = self.sample_imu_6dof(t_sec=t_sec)
+            imu = self.sample_imu_6dof(t_sec=t_sec, index=index)
 
-        latest_m = self.store.df_met.iloc[-1]
+        latest_m = self._get_met_row(index=index)
         wdir_deg = float(latest_m["WDIR_deg"])
         wspd_mps = float(latest_m["WSPD_mps"])
 
@@ -249,6 +335,7 @@ class SmartBuoySimulator:
         lon = STATION_46050_LON + (east_m / meters_per_deg_lon)
         offset_m = math.hypot(east_m, north_m)
         drift_bearing_deg = (math.degrees(math.atan2(east_m, north_m)) + 360.0) % 360.0
+        horiz_disp_m = math.hypot(float(imu["surge_m"]), float(imu["sway_m"]))
 
         return {
             "station_id": "46050",
@@ -259,7 +346,7 @@ class SmartBuoySimulator:
             "watch_circle_offset_m": round(offset_m, 2),
             "watch_circle_limit_m": WATCH_CIRCLE_RADIUS_M,
             "drift_bearing_deg": round(drift_bearing_deg, 1),
-            "sog_knots": round(abs(imu["surge_m"]) * 0.35, 2),
+            "sog_knots": round(horiz_disp_m * 0.35, 2),
             "fix_quality": 2,  # DGPS
             "satellites": 11,
             "hdop": 0.8,
@@ -267,9 +354,7 @@ class SmartBuoySimulator:
 
     def sample_met_ocean(self, index: int = -1, jitter: bool = True) -> Dict[str, Any]:
         """Return a meteorological-oceanographic frame anchored on NOAA NDBC 46050."""
-        assert self.store.df_met is not None
-        idx = index if -len(self.store.df_met) <= index < len(self.store.df_met) else -1
-        row = self.store.df_met.iloc[idx]
+        row = self._get_met_row(index=index)
         noise = (lambda s: float(self.rng.normal(0.0, s))) if jitter else (lambda _: 0.0)
 
         wdir = (float(row["WDIR_deg"]) + noise(0.6)) % 360.0
@@ -282,7 +367,7 @@ class SmartBuoySimulator:
 
         return {
             "station": "NOAA NDBC 46050",
-            "source_timestamp": row["timestamp"].strftime("%Y-%m-%d %H:%M UTC"),
+            "source_timestamp": row["timestamp_str"],
             "WDIR_deg": round(wdir, 1),
             "WSPD_mps": round(wspd, 2),
             "GST_mps": round(gst, 2),
@@ -294,9 +379,7 @@ class SmartBuoySimulator:
 
     def sample_sonde(self, index: int = -1, jitter: bool = True) -> Dict[str, Any]:
         """Return a 7-channel water quality sonde frame anchored on NOAA NERRS ACQS1."""
-        assert self.store.df_wq is not None
-        idx = index if -len(self.store.df_wq) <= index < len(self.store.df_wq) else -1
-        row = self.store.df_wq.iloc[idx]
+        row = self._get_wq_row(index=index)
         noise = (lambda s: float(self.rng.normal(0.0, s))) if jitter else (lambda _: 0.0)
 
         otmp = float(row["OTMP_c"]) + noise(0.02)
@@ -309,7 +392,7 @@ class SmartBuoySimulator:
 
         return {
             "station": "NOAA NERRS ACQS1",
-            "source_timestamp": row["timestamp"].strftime("%Y-%m-%d %H:%M UTC"),
+            "source_timestamp": row["timestamp_str"],
             "OTMP_c": round(otmp, 2),
             "COND_mscm": round(cond, 2),
             "SAL_psu": round(sal, 2),
@@ -348,24 +431,27 @@ class SmartBuoySimulator:
         index: int = -1,
         dt: Optional[datetime] = None,
         jitter: bool = True,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Synthesize a complete Edge Smart Buoy telemetry frame (IMU + GPS + Met + Sonde + NMEA-0183)."""
-        assert self.store.hm0_series is not None and self.store.tp_series is not None
-        assert self.store.tm01_series is not None and self.store.tm02_series is not None
-        assert self.store.eps_series is not None
-
         if dt is None:
             dt = datetime.now(timezone.utc)
         if t_sec is None:
             t_sec = self._step_counter * 0.5
         self._step_counter += 1
 
-        spec_idx = self._select_spectrum_index()
-        imu = self.sample_imu_6dof(t_sec=t_sec)
-        gps = self.sample_gps(t_sec=t_sec, imu=imu)
+        active_mode = mode if mode in ("latest", "peak") else self.mode
+        spec_idx = self._select_spectrum_index(mode=active_mode)
+        imu = self.sample_imu_6dof(t_sec=t_sec, mode=active_mode, index=index)
+        gps = self.sample_gps(t_sec=t_sec, imu=imu, index=index)
         met = self.sample_met_ocean(index=index, jitter=jitter)
         sonde = self.sample_sonde(index=index, jitter=jitter)
         nmea = self.generate_nmea_sentences(met=met, sonde=sonde, dt=dt)
+
+        def _safe_series_val(arr: Optional[np.ndarray], idx: int, default: float) -> float:
+            if arr is not None and len(arr) > idx:
+                return float(arr[idx])
+            return default
 
         return {
             "sequence_id": self._step_counter,
@@ -376,12 +462,12 @@ class SmartBuoySimulator:
             "met_ocean": met,
             "water_quality": sonde,
             "wave_spectra_summary": {
-                "mode": self.mode,
-                "hm0_m": round(float(self.store.hm0_series[spec_idx]), 3),
-                "tp_s": round(float(self.store.tp_series[spec_idx]), 2),
-                "tm01_s": round(float(self.store.tm01_series[spec_idx]), 2),
-                "tm02_s": round(float(self.store.tm02_series[spec_idx]), 2),
-                "bandwidth_eps": round(float(self.store.eps_series[spec_idx]), 3),
+                "mode": active_mode,
+                "hm0_m": round(_safe_series_val(self.store.hm0_series, spec_idx, met["WVHT_m"]), 3),
+                "tp_s": round(_safe_series_val(self.store.tp_series, spec_idx, met["DPD_s"]), 2),
+                "tm01_s": round(_safe_series_val(self.store.tm01_series, spec_idx, met["APD_s"]), 2),
+                "tm02_s": round(_safe_series_val(self.store.tm02_series, spec_idx, met["APD_s"]), 2),
+                "bandwidth_eps": round(_safe_series_val(self.store.eps_series, spec_idx, 0.5), 3),
             },
             "nmea_sentences": nmea,
         }

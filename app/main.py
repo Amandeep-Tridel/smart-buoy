@@ -48,7 +48,7 @@ vision_engine = MarineVisionEngine()
 
 class SampleDetectRequest(BaseModel):
     sample_id: str = Field(..., min_length=1)
-    mode: str = Field(default="buoy", pattern="^(buoy|colregs|sar|horizon)$")
+    mode: str = Field(default="buoy", pattern="^(buoy|colregs|sar|horizon|all|ensemble)$")
     conf: float = Field(default=0.25, ge=0.01, le=0.99)
 
 
@@ -105,13 +105,14 @@ async def get_telemetry() -> JSONResponse:
 
 @app.post("/api/telemetry/refresh")
 async def refresh_live_noaa() -> JSONResponse:
-    telemetry_store.reload(force_refresh=True)
+    await asyncio.to_thread(telemetry_store.reload, True)
     return JSONResponse({"status": "refreshed", "telemetry": telemetry_store.get_telemetry_payload()})
 
 
 @app.get("/api/forecast")
 async def get_forecast() -> JSONResponse:
-    return JSONResponse(timeseries_engine.evaluate_and_forecast(telemetry_store))
+    payload = await asyncio.to_thread(timeseries_engine.evaluate_and_forecast, telemetry_store)
+    return JSONResponse(payload)
 
 
 @app.get("/api/vision/samples")
@@ -129,7 +130,8 @@ async def detect_on_sample(req: SampleDetectRequest) -> JSONResponse:
         raise HTTPException(status_code=404, detail=f"Sample not found: {req.sample_id}")
     img_bytes = sample_path.read_bytes()
     try:
-        res = vision_engine.run_detection(
+        res = await asyncio.to_thread(
+            vision_engine.run_detection,
             image_bytes=img_bytes,
             mode=req.mode,
             conf_threshold=req.conf,
@@ -155,7 +157,8 @@ async def detect_on_upload(
     if not img_bytes:
         raise HTTPException(status_code=400, detail="Empty image file uploaded.")
     try:
-        res = vision_engine.run_detection(
+        res = await asyncio.to_thread(
+            vision_engine.run_detection,
             image_bytes=img_bytes,
             mode=mode,
             conf_threshold=conf,
@@ -174,17 +177,17 @@ async def websocket_live_buoy(ws: WebSocket) -> None:
     assert telemetry_store.df_met is not None and telemetry_store.df_wq is not None
     assert telemetry_store.freqs is not None and telemetry_store.spec_matrix is not None
 
-    latest_m = telemetry_store.df_met.iloc[-1]
-    latest_w = telemetry_store.df_wq.iloc[-1]
-    freqs = telemetry_store.freqs
-    spec_latest = telemetry_store.spec_matrix[-1]
-    df_f = np.gradient(freqs)
-    amps = np.sqrt(2.0 * np.maximum(spec_latest, 0.0) * df_f)
-    phases = np.linspace(0.0, 2.0 * math.pi, len(freqs))
-
     t_start = time.time()
     try:
         while True:
+            latest_m = telemetry_store.df_met.iloc[-1]
+            latest_w = telemetry_store.df_wq.iloc[-1]
+            freqs = telemetry_store.freqs
+            spec_latest = telemetry_store.spec_matrix[-1]
+            df_f = np.gradient(freqs)
+            amps = np.sqrt(2.0 * np.maximum(spec_latest, 0.0) * df_f)
+            phases = np.linspace(0.0, 2.0 * math.pi, len(freqs))
+
             t = time.time() - t_start
             # Superpose real 46-band NOAA wave components for live 6-DOF buoy heave, roll, pitch
             heave_m = float(np.sum(amps * np.cos(2.0 * math.pi * freqs * t + phases)))

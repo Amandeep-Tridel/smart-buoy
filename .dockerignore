@@ -35,6 +35,7 @@ Thumbs.db
 *.log
 .vscode/
 .idea/
+.codegraph/
 
 # Explicitly preserve required runtime directories and files
 !app/**
@@ -42,6 +43,9 @@ Thumbs.db
 !weights/**
 !samples/**
 !assets/**
+!docs/**
 !tests/**
+!run.py
+!cli.py
 !requirements.txt
 !README.md

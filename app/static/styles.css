@@ -302,6 +302,49 @@ body {
   margin-top: 4px;
 }
 
+/* Maritime Hazard & Environmental Alert Strip */
+.alerts-strip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: rgba(16, 32, 54, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+}
+
+.alerts-strip-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.alerts-summary-text {
+  font-size: 0.78rem;
+  color: #cbd5e1;
+}
+
+.alerts-domain-pills {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.domain-pill {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: rgba(6, 13, 24, 0.65);
+  border: 1px solid rgba(30, 53, 84, 0.8);
+  color: var(--text-muted);
+}
+
 /* Panels */
 .panel {
   background: var(--bg-card);
@@ -675,16 +718,68 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
 }
 
 .detections-header h3 {
   font-size: 0.82rem;
 }
 
+.det-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .detections-header span {
   font-size: 0.72rem;
   color: var(--text-muted);
+}
+
+.risk-pill {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem !important;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+}
+
+.risk-clear, .risk-nominal {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #34d399 !important;
+}
+
+.risk-caution, .risk-advisory {
+  background: rgba(14, 165, 233, 0.18);
+  border-color: rgba(14, 165, 233, 0.4);
+  color: #38bdf8 !important;
+}
+
+.risk-warning {
+  background: rgba(245, 158, 11, 0.2);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fbbf24 !important;
+}
+
+.risk-critical {
+  background: rgba(244, 63, 94, 0.24);
+  border-color: rgba(244, 63, 94, 0.55);
+  color: #fb7185 !important;
+}
+
+.colregs-advisory {
+  font-size: 0.71rem;
+  line-height: 1.35;
+  padding: 6px 9px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: rgba(6, 13, 24, 0.55);
+  border-left: 3px solid var(--accent-blue);
+  color: #cbd5e1;
 }
 
 .table-scroll {

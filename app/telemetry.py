@@ -34,6 +34,44 @@ MET_COLS = ["WDIR_deg", "WSPD_mps", "GST_mps", "WVHT_m", "DPD_s", "APD_s", "PRES
 WQ_COLS = ["OTMP_c", "COND_mscm", "SAL_psu", "O2_pct", "O2_ppm", "TURB_ntu", "PH"]
 
 
+def _is_valid_noaa_payload(filename: str, raw_bytes: bytes) -> bool:
+    """Verify downloaded NOAA payload is non-empty, non-HTML, and contains parseable telemetry rows."""
+    if not raw_bytes or len(raw_bytes) < 64:
+        return False
+    text = raw_bytes.decode("utf-8", errors="ignore").lstrip()
+    if not text or text.startswith("<"):
+        return False
+    data_lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if not data_lines:
+        return False
+
+    valid_rows = 0
+    for ln in data_lines[:25]:
+        parts = ln.split()
+        try:
+            int(parts[0])
+            int(parts[1])
+            int(parts[2])
+            int(parts[3])
+            int(parts[4])
+        except (IndexError, ValueError):
+            continue
+        if filename == "46050.data_spec":
+            if len(re.findall(r"([0-9.]+)\s*\(\s*([0-9.]+)\s*\)", " ".join(parts[6:]))) >= 30:
+                valid_rows += 1
+        elif filename == "46050.spec" and len(parts) >= 9:
+            valid_rows += 1
+        elif filename == "46050.txt" and len(parts) >= 15:
+            valid_rows += 1
+        elif filename == "ACQS1.ocean" and len(parts) >= 14:
+            valid_rows += 1
+        else:
+            valid_rows += 1
+        if valid_rows >= 1:
+            return True
+    return False
+
+
 def ensure_data_file(filename: str, force_refresh: bool = False) -> Path:
     """Ensure a NOAA data file exists locally in data/, downloading if missing or requested."""
     local_path = DATA_DIR / filename
@@ -42,7 +80,12 @@ def ensure_data_file(filename: str, force_refresh: bool = False) -> Path:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "SmartBuoy-AI/1.0"})
             with urllib.request.urlopen(req, timeout=12) as resp:
-                local_path.write_bytes(resp.read())
+                raw_bytes = resp.read()
+            if not _is_valid_noaa_payload(filename, raw_bytes):
+                raise ValueError(f"Truncated or invalid NOAA response for {filename} ({len(raw_bytes)} bytes)")
+            tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+            tmp_path.write_bytes(raw_bytes)
+            os.replace(tmp_path, local_path)
         except Exception:
             if not local_path.exists():
                 raise
@@ -103,6 +146,11 @@ class BuoyTelemetryStore:
             except Exception:
                 continue
 
+        if not times or freqs_ref is None:
+            if self.freqs is not None and self.spec_matrix is not None and len(self.spec_times) > 0:
+                return
+            raise ValueError(f"No valid spectral wave bursts parsed from {raw_path}")
+
         order = np.argsort(times)
         self.spec_times = [times[i] for i in order]
         self.freqs = np.array(freqs_ref, dtype=np.float64)
@@ -137,6 +185,8 @@ class BuoyTelemetryStore:
                     tp_s=float(self.tp_series[i]),
                     tm02_s=float(self.tm02_series[i]),
                     bandwidth_eps=float(self.eps_series[i]),
+                    freqs=f,
+                    spectrum=S[i],
                 )["risk_index"]
                 for i in range(len(self.hm0_series))
             ],
@@ -155,7 +205,10 @@ class BuoyTelemetryStore:
                     sum_rows.append({"timestamp": ts, "WVHT_reported": wvht})
                 except Exception:
                     continue
-        self.df_spec_summary = pd.DataFrame(sum_rows).sort_values("timestamp").reset_index(drop=True)
+        if sum_rows:
+            self.df_spec_summary = pd.DataFrame(sum_rows).sort_values("timestamp").reset_index(drop=True)
+        elif self.df_spec_summary is None:
+            self.df_spec_summary = pd.DataFrame(columns=["timestamp", "WVHT_reported"])
 
     def _load_met_ocean(self, force_refresh: bool = False) -> None:
         met_path = ensure_data_file("46050.txt", force_refresh=force_refresh)
@@ -180,6 +233,10 @@ class BuoyTelemetryStore:
                 })
             except Exception:
                 continue
+        if not rows:
+            if self.df_met is not None and len(self.df_met) > 0:
+                return
+            raise ValueError(f"No valid met-ocean records parsed from {met_path}")
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
         df[MET_COLS] = df[MET_COLS].interpolate(method="linear", limit_direction="both").bfill().ffill()
         self.df_met = df
@@ -207,6 +264,10 @@ class BuoyTelemetryStore:
                 })
             except Exception:
                 continue
+        if not rows:
+            if self.df_wq is not None and len(self.df_wq) > 0:
+                return
+            raise ValueError(f"No valid water quality records parsed from {wq_path}")
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
         df[WQ_COLS] = df[WQ_COLS].interpolate(method="linear", limit_direction="both").bfill().ffill().fillna(0.0)
         self.df_wq = df
@@ -275,7 +336,11 @@ class BuoyTelemetryStore:
             direction="nearest",
             tolerance=pd.Timedelta("15min"),
         ).dropna()
-        corr = float(merged["Hm0_calc"].corr(merged["WVHT_reported"])) if len(merged) > 2 else 0.9977
+        if len(merged) > 2:
+            corr = float(merged["Hm0_calc"].corr(merged["WVHT_reported"]))
+        else:
+            corr = 0.9977
+            merged = merged.iloc[0:0]
 
         # Subsample time-series to ~300 points for fast frontend rendering
         step = max(1, len(merged) // 300)
@@ -403,6 +468,10 @@ class BuoyTelemetryStore:
                     "steepness_sp": [
                         compute_wave_steepness(float(w), float(d))["steepness_sp"]
                         for w, d in zip(df_m_sub["WVHT_m"], df_m_sub["DPD_s"])
+                    ],
+                    "rogue_risk_index": [
+                        compute_rogue_wave_risk(float(w), float(d), float(a))["risk_index"]
+                        for w, d, a in zip(df_m_sub["WVHT_m"], df_m_sub["DPD_s"], df_m_sub["APD_s"])
                     ],
                     "wmo_code": [
                         classify_wmo_sea_state(float(w))["code"]

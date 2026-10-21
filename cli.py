@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -194,19 +195,22 @@ def cmd_forecast(args: argparse.Namespace) -> int:
 
 def _resolve_image_path(image_arg: str) -> Optional[Path]:
     """Resolve an image path directly, relative to repo root, or inside samples/."""
-    cand = Path(image_arg)
+    if not isinstance(image_arg, str) or not image_arg.strip():
+        return None
+    cleaned = image_arg.strip()
+    cand = Path(cleaned)
     if cand.is_file():
         return cand.resolve()
-    repo_cand = BASE_DIR / image_arg
+    repo_cand = BASE_DIR / cleaned
     if repo_cand.is_file():
         return repo_cand.resolve()
-    sample_cand = SAMPLES_DIR / image_arg
+    sample_cand = SAMPLES_DIR / cleaned
     if sample_cand.is_file():
         return sample_cand.resolve()
-    # Search by filename inside samples/*
-    if SAMPLES_DIR.exists():
-        for match in SAMPLES_DIR.rglob(cand.name):
-            if match.is_file():
+    # Search by bare filename inside samples/* only when no directory prefix was given
+    if cand.parent == Path(".") and cand.name and SAMPLES_DIR.exists():
+        for match in sorted(SAMPLES_DIR.rglob("*")):
+            if match.is_file() and match.name == cand.name:
                 return match.resolve()
     return None
 
@@ -232,8 +236,12 @@ def cmd_detect(args: argparse.Namespace) -> int:
         print(f"Error: Image file not found: {args.image}", file=sys.stderr)
         return 1
 
-    if not (0.0 < args.conf <= 1.0):
+    if not (math.isfinite(args.conf) and 0.0 < args.conf <= 1.0):
         print(f"Error: Confidence threshold must be in (0.0, 1.0], got {args.conf}", file=sys.stderr)
+        return 1
+
+    if not (math.isfinite(args.hfov) and 0.0 < args.hfov < 180.0):
+        print(f"Error: Horizontal FOV (--hfov) must be in (0.0, 180.0), got {args.hfov}", file=sys.stderr)
         return 1
 
     mode = _infer_vision_mode(resolved, args.mode)
@@ -244,19 +252,28 @@ def cmd_detect(args: argparse.Namespace) -> int:
     except ValueError:
         source_hint = resolved.name
 
-    img_bytes = resolved.read_bytes()
+    try:
+        img_bytes = resolved.read_bytes()
+    except OSError as exc:
+        print(f"Error: Unable to read image file {resolved}: {exc}", file=sys.stderr)
+        return 1
+
     if not img_bytes:
         print(f"Error: Image file is empty: {resolved}", file=sys.stderr)
         return 1
 
     engine = MarineVisionEngine()
-    res = engine.run_detection(
-        image_bytes=img_bytes,
-        mode=mode,
-        conf_threshold=args.conf,
-        hfov_deg=args.hfov,
-        source_hint=source_hint,
-    )
+    try:
+        res = engine.run_detection(
+            image_bytes=img_bytes,
+            mode=mode,
+            conf_threshold=args.conf,
+            hfov_deg=args.hfov,
+            source_hint=source_hint,
+        )
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     if args.output:
         out_path = Path(args.output)
@@ -310,8 +327,8 @@ def cmd_nmea_stream(args: argparse.Namespace) -> int:
     if args.count < 0:
         print(f"Error: --count must be >= 0, got {args.count}", file=sys.stderr)
         return 1
-    if args.interval < 0:
-        print(f"Error: --interval must be >= 0, got {args.interval}", file=sys.stderr)
+    if not math.isfinite(args.interval) or args.interval < 0:
+        print(f"Error: --interval must be a finite number >= 0, got {args.interval}", file=sys.stderr)
         return 1
 
     sim = SmartBuoySimulator(seed=args.seed, mode=args.mode)
@@ -384,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("image", help="Path to input image or sample filename/ID under samples/")
     p_detect.add_argument(
         "--mode",
-        choices=["buoy", "colregs", "sar", "horizon", "all"],
+        choices=["buoy", "colregs", "sar", "horizon", "all", "ensemble"],
         default=None,
         help="Vision mode (auto-inferred from path if omitted)",
     )

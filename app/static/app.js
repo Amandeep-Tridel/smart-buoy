@@ -18,7 +18,12 @@ let chartHm0Corr = null;
 let chartWaveForecast = null;
 let chartWqAnomaly = null;
 
+let visionRequestSeq = 0;
+let spectraRequestSeq = 0;
+
 let wsReconnectAttempts = 0;
+let wsReconnectTimer = null;
+let activeWebSocket = null;
 let bannerTimeout = null;
 
 if (typeof Chart !== "undefined") {
@@ -111,9 +116,17 @@ function initControls() {
       hideVisionError();
       currentUploadFile = null;
       updateUploadBadge(null);
-      const fallback = allSamples[0];
-      if (fallback) {
-        await runSampleDetection(fallback.id);
+      if (allSamples.length === 0) {
+        try {
+          await loadVisionSamples();
+        } catch (_err) {
+          // Error already displayed by loadVisionSamples
+        }
+        return;
+      }
+      const targetId = currentSampleId || allSamples[0]?.id;
+      if (targetId) {
+        await runSampleDetection(targetId);
       }
     });
   }
@@ -193,7 +206,10 @@ function initControls() {
       document.querySelectorAll("[data-corr-mode]").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       currentCorrMode = btn.dataset.corrMode;
-      const specData = cachedSpectraData.peak || cachedSpectraData.latest;
+      const specData =
+        (currentSpecMode === "latest" ? cachedSpectraData.latest : cachedSpectraData.peak) ||
+        cachedSpectraData.peak ||
+        cachedSpectraData.latest;
       if (specData) {
         renderCorrelationChart(specData);
       }
@@ -264,6 +280,7 @@ async function loadStatus() {
 }
 
 async function loadWaveSpectra(mode = "peak") {
+  const reqId = ++spectraRequestSeq;
   try {
     let data;
     if (mode === "compare") {
@@ -271,16 +288,25 @@ async function loadWaveSpectra(mode = "peak") {
         cachedSpectraData.peak ? Promise.resolve(cachedSpectraData.peak) : fetchJson("/api/wave-spectra?mode=peak"),
         cachedSpectraData.latest ? Promise.resolve(cachedSpectraData.latest) : fetchJson("/api/wave-spectra?mode=latest"),
       ]);
+      if (reqId !== spectraRequestSeq) return;
       cachedSpectraData.peak = peakData;
       cachedSpectraData.latest = latestData;
       data = peakData;
     } else {
       const queryMode = mode === "latest" ? "latest" : "peak";
       data = await fetchJson(`/api/wave-spectra?mode=${queryMode}`);
+      if (reqId !== spectraRequestSeq) return;
       cachedSpectraData[queryMode] = data;
     }
 
     const m = data.metrics || {};
+    if (m.peak_hm0_m !== undefined) {
+      setText("btn-spec-peak", `Peak Storm (${Number(m.peak_hm0_m).toFixed(2)}m)`);
+    }
+    if (m.latest_hm0_m !== undefined) {
+      setText("btn-spec-latest", `Latest Burst (${Number(m.latest_hm0_m).toFixed(2)}m)`);
+    }
+
     const subEl = document.getElementById("spec-subtitle");
     if (subEl) {
       if (mode === "compare" && cachedSpectraData.peak && cachedSpectraData.latest) {
@@ -290,34 +316,52 @@ async function loadWaveSpectra(mode = "peak") {
       }
     }
 
-    // Populate spectral moments strip
+    // Populate Panel 1 spectral moments strip
     setText("spec-hm0", `${Number(m.hm0_m ?? 0).toFixed(2)} m`);
     setText("spec-tp", `${Number(m.tp_s ?? 0).toFixed(2)} s`);
     setText("spec-tm01", `${Number(m.tm01_s ?? 0).toFixed(2)} s`);
     setText("spec-tm02", `${Number(m.tm02_s ?? 0).toFixed(2)} s`);
     setText("spec-eps", `${Number(m.bandwidth_eps ?? 0).toFixed(3)}`);
 
-    if (m.correlation_r !== undefined) {
-      setText("hm0-corr-badge", `r = ${Number(m.correlation_r).toFixed(4)}`);
-    }
-    if (data.total_bursts) {
-      setText(
-        "corr-subtitle",
-        `${Number(data.total_bursts).toLocaleString()} Real Spectral Bursts • Stonewall Bank Offshore Buoy (NOAA 46050)`
-      );
-    }
+    // Populate Panel 2 spectral physics & sea-state strip
+    const wmoLabel = m.wmo_sea_state_label
+      ? `WMO ${m.wmo_sea_state_code ?? "--"} (${m.wmo_sea_state_label})`
+      : "--";
+    setText("corr-wmo", wmoLabel);
+    setText(
+      "corr-steepness",
+      m.steepness_sp !== undefined
+        ? `${Number(m.steepness_sp).toFixed(4)} (${m.steepness_regime || "Mod"})`
+        : "--"
+    );
+    setText(
+      "corr-rogue",
+      m.rogue_risk_level
+        ? `${m.rogue_risk_level} (${Number(m.rogue_risk_index ?? 0).toFixed(2)})`
+        : "--"
+    );
+    setText(
+      "corr-bfi",
+      m.benjamin_feir_index !== undefined ? Number(m.benjamin_feir_index).toFixed(3) : "--"
+    );
+    setText(
+      "corr-hmax",
+      m.expected_hmax_3hr_m !== undefined ? `${Number(m.expected_hmax_3hr_m).toFixed(2)} m` : "-- m"
+    );
 
     renderSpectrumChart(data, mode);
     renderCorrelationChart(data);
   } catch (err) {
-    showStatusBanner(`Failed to load wave spectra: ${err.message}`, "error");
+    if (reqId === spectraRequestSeq) {
+      showStatusBanner(`Failed to load wave spectra: ${err.message}`, "error");
+    }
     throw err;
   }
 }
 
 function renderSpectrumChart(data, mode) {
   const canvas = document.getElementById("chart-spectrum");
-  if (!canvas) return;
+  if (!canvas || !data || !data.spectrum) return;
   const ctx1 = canvas.getContext("2d");
 
   const datasets = [];
@@ -372,6 +416,17 @@ function renderSpectrumChart(data, mode) {
         pointRadius: 0,
       }
     );
+    if (Array.isArray(data.spectrum.pierson_moskowitz_m2_hz)) {
+      datasets.push({
+        label: "Pierson-Moskowitz S_PM(f)",
+        data: data.spectrum.pierson_moskowitz_m2_hz,
+        borderColor: "#f59e0b",
+        borderDash: [3, 3],
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+      });
+    }
   }
 
   if (typeof Chart === "undefined") {
@@ -400,10 +455,27 @@ function renderSpectrumChart(data, mode) {
 
 function renderCorrelationChart(data) {
   const canvas = document.getElementById("chart-hm0-corr");
-  if (!canvas || !data.history) return;
+  if (!canvas || !data || !data.history) return;
   const ctx2 = canvas.getContext("2d");
 
   const isPeriod = currentCorrMode === "period";
+  const m = data.metrics || {};
+  const burstsText = data.total_bursts
+    ? `${Number(data.total_bursts).toLocaleString()} Real Spectral Bursts`
+    : "Real Spectral Bursts";
+
+  if (isPeriod) {
+    setText("corr-subtitle", `${burstsText} • Peak Period Tp vs. Mean Zero-Crossing Period Tm02`);
+    const ratio =
+      m.tp_s && m.tm02_s ? (Number(m.tp_s) / Math.max(0.1, Number(m.tm02_s))).toFixed(2) : "1.28";
+    setText("hm0-corr-badge", `Tp/Tm02 = ${ratio}`);
+  } else {
+    setText("corr-subtitle", `${burstsText} • Stonewall Bank Offshore Buoy (NOAA 46050)`);
+    if (m.correlation_r !== undefined) {
+      setText("hm0-corr-badge", `r = ${Number(m.correlation_r).toFixed(4)}`);
+    }
+  }
+
   const datasets = isPeriod
     ? [
         {
@@ -465,50 +537,148 @@ function renderCorrelationChart(data) {
 }
 
 async function loadTelemetryAndForecast() {
-  try {
-    const [tel, fc] = await Promise.all([fetchJson("/api/telemetry"), fetchJson("/api/forecast")]);
-    cachedForecastData = fc;
+  const [telRes, fcRes] = await Promise.allSettled([
+    fetchJson("/api/telemetry"),
+    fetchJson("/api/forecast"),
+  ]);
 
-    const mLatest = tel.met_ocean.latest;
-    const wLatest = tel.water_quality.latest;
+  let telError = null;
+  let fcError = null;
+
+  if (telRes.status === "fulfilled" && telRes.value) {
+    const tel = telRes.value;
+    const mLatest = tel.met_ocean?.latest;
+    const wLatest = tel.water_quality?.latest;
+
+    if (mLatest) {
+      setText("kpi-hs", `${Number(mLatest.WVHT_m).toFixed(2)} m`);
+      setText(
+        "kpi-tp",
+        `${Number(mLatest.DPD_s).toFixed(1)} s / ${Number(mLatest.APD_s).toFixed(1)} s`
+      );
+      setText(
+        "kpi-wind",
+        `${Number(mLatest.WSPD_mps).toFixed(1)} m/s (${Number(mLatest.WDIR_deg).toFixed(0)}°)`
+      );
+      setText(
+        "kpi-pres",
+        `Gust: ${Number(mLatest.GST_mps).toFixed(1)} m/s • Baro: ${Number(mLatest.PRES_hpa).toFixed(1)} hPa`
+      );
+    }
+
+    if (wLatest) {
+      setText("kpi-wq", `${Number(wLatest.O2_ppm).toFixed(2)} mg/L O₂`);
+      setText(
+        "kpi-wq-sub",
+        `Turb: ${Number(wLatest.TURB_ntu).toFixed(1)} NTU • Sal: ${Number(wLatest.SAL_psu).toFixed(1)} PSU • pH: ${Number(wLatest.PH).toFixed(2)}`
+      );
+    }
+  } else if (telRes.status === "rejected") {
+    telError = telRes.reason;
+  }
+
+  if (fcRes.status === "fulfilled" && fcRes.value) {
+    const fc = fcRes.value;
+    cachedForecastData = fc;
     const wf = fc.wave_forecast;
     const wqa = fc.water_quality_anomaly;
 
-    setText("kpi-hs", `${mLatest.WVHT_m.toFixed(2)} m`);
-    const signHs = wf.live_prediction.delta_hs_m >= 0 ? "+" : "";
-    setText(
-      "kpi-hs-forecast",
-      `1h AI Forecast: ${wf.live_prediction.forecast_hs_1h_m.toFixed(2)} m (${signHs}${wf.live_prediction.delta_hs_m.toFixed(3)} m)`
-    );
+    if (wf && wf.live_prediction) {
+      const signHs = wf.live_prediction.delta_hs_m >= 0 ? "+" : "";
+      setText(
+        "kpi-hs-forecast",
+        `1h AI Forecast: ${Number(wf.live_prediction.forecast_hs_1h_m).toFixed(2)} m (${signHs}${Number(wf.live_prediction.delta_hs_m).toFixed(3)} m)`
+      );
+      setText(
+        "kpi-tp-forecast",
+        `1h AI Period (Ta) Forecast: ${Number(wf.live_prediction.forecast_apd_1h_s).toFixed(2)} s`
+      );
+    }
 
-    setText("kpi-tp", `${mLatest.DPD_s.toFixed(1)} s / ${mLatest.APD_s.toFixed(1)} s`);
-    setText("kpi-tp-forecast", `1h AI Period (Ta) Forecast: ${wf.live_prediction.forecast_apd_1h_s.toFixed(2)} s`);
-
-    setText("kpi-wind", `${mLatest.WSPD_mps.toFixed(1)} m/s (${mLatest.WDIR_deg.toFixed(0)}°)`);
-    setText("kpi-pres", `Gust: ${mLatest.GST_mps.toFixed(1)} m/s • Baro: ${mLatest.PRES_hpa.toFixed(1)} hPa`);
-
-    setText("kpi-wq", `${wLatest.O2_ppm.toFixed(2)} mg/L O₂`);
-    setText(
-      "kpi-wq-sub",
-      `Turb: ${wLatest.TURB_ntu.toFixed(1)} NTU • Sal: ${wLatest.SAL_psu.toFixed(1)} PSU • pH: ${wLatest.PH.toFixed(2)}`
-    );
-
-    const wqBadge = document.getElementById("kpi-wq-badge");
-    if (wqBadge) {
-      if (wqa.latest_is_anomaly) {
-        wqBadge.textContent = "PLUME ANOMALY";
-        wqBadge.className = "kpi-tag tag-red";
-      } else {
-        wqBadge.textContent = "SONDE NORMAL";
-        wqBadge.className = "kpi-tag tag-emerald";
+    if (wqa) {
+      const wqBadge = document.getElementById("kpi-wq-badge");
+      if (wqBadge) {
+        if (wqa.latest_is_anomaly) {
+          wqBadge.textContent = "PLUME ANOMALY";
+          wqBadge.className = "kpi-tag tag-red";
+        } else {
+          wqBadge.textContent = "SONDE NORMAL";
+          wqBadge.className = "kpi-tag tag-emerald";
+        }
       }
     }
 
-    renderWaveForecastChart(wf);
-    renderWaterQualityChart(wqa);
-  } catch (err) {
-    showStatusBanner(`Telemetry/Forecast error: ${err.message}`, "error");
-    throw err;
+    if (fc.alerts) {
+      renderMaritimeAlerts(fc.alerts);
+    }
+    if (wf) {
+      renderWaveForecastChart(wf);
+    }
+    if (wqa) {
+      renderWaterQualityChart(wqa);
+    }
+  } else if (fcRes.status === "rejected") {
+    fcError = fcRes.reason;
+  }
+
+  if (telError || fcError) {
+    const errMsg = (telError || fcError)?.message || "Failed to load telemetry or forecast.";
+    showStatusBanner(`Telemetry/Forecast error: ${errMsg}`, "error");
+    throw telError || fcError;
+  }
+}
+
+function renderMaritimeAlerts(alertsPayload) {
+  if (!alertsPayload) return;
+  const overallPill = document.getElementById("alerts-overall-pill");
+  const summaryText = document.getElementById("alerts-summary-text");
+  const sev = (alertsPayload.overall_severity || alertsPayload.live_severity || "NOMINAL").toUpperCase();
+
+  if (overallPill) {
+    overallPill.textContent = `HAZARD WATCH: ${sev}`;
+    overallPill.className = `risk-pill risk-${sev.toLowerCase()}`;
+  }
+  if (summaryText) {
+    const activeAlerts = alertsPayload.active_alerts || [];
+    const histAlerts = alertsPayload.historical_alerts || [];
+    const topAlert = activeAlerts[0] || histAlerts[0];
+    if (topAlert && topAlert.title) {
+      summaryText.textContent = `${topAlert.title} — ${topAlert.recommended_action || topAlert.message || ""}`;
+    } else if (alertsPayload.summary) {
+      summaryText.textContent = alertsPayload.summary;
+    } else {
+      summaryText.textContent = "All 5 oceanographic and water quality hazard domains operating within nominal bounds.";
+    }
+  }
+
+  const cats = alertsPayload.categories || {};
+  if (cats.wave_height) {
+    setText(
+      "alert-domain-wave",
+      `Wave: ${cats.wave_height.current_value ?? "--"}m (Peak ${cats.wave_height.peak_value ?? "--"}m)`
+    );
+  }
+  if (cats.pressure_drop) {
+    const dp = Number(cats.pressure_drop.current_drop_3h_hpa ?? 0);
+    setText("alert-domain-baro", `Baro 3h: ${dp >= 0 ? "+" : ""}${dp.toFixed(1)} hPa`);
+  }
+  if (cats.gale_gust) {
+    setText(
+      "alert-domain-wind",
+      `Gust: ${cats.gale_gust.current_value ?? "--"} m/s (Peak ${cats.gale_gust.peak_value ?? "--"} m/s)`
+    );
+  }
+  if (cats.hypoxia) {
+    setText(
+      "alert-domain-hypoxia",
+      `DO: ${cats.hypoxia.current_value ?? "--"} mg/L (Min ${cats.hypoxia.min_value ?? "--"})`
+    );
+  }
+  if (cats.water_quality_anomaly) {
+    setText(
+      "alert-domain-wq",
+      `Plume AE: ${cats.water_quality_anomaly.event_count ?? "--"} events`
+    );
   }
 }
 
@@ -520,10 +690,36 @@ function renderWaveForecastChart(wf) {
   const isApd = currentFcMode === "apd";
   if (isApd) {
     setText("forecast-r2-badge", `R² = ${wf.metrics.apd_r2.toFixed(4)} | MAE = ${wf.metrics.apd_mae_s.toFixed(3)}s`);
-    setText("forecast-subtitle", "6-Hour Lookback → 1-Hour Ahead Average Wave Period (Ta) Prediction");
+    setText("forecast-subtitle", "6-Hour Lookback → 1-Hour Ahead Average Wave Period (Ta) Prediction (95% MC Dropout CI)");
   } else {
     setText("forecast-r2-badge", `R² = ${wf.metrics.hs_r2.toFixed(4)} | MAE = ${wf.metrics.hs_mae_m.toFixed(3)}m`);
-    setText("forecast-subtitle", "6-Hour Lookback → 1-Hour Ahead Significant Wave Height (Hs) Prediction");
+    setText("forecast-subtitle", "6-Hour Lookback → 1-Hour Ahead Significant Wave Height (Hs) Prediction (95% MC Dropout CI)");
+  }
+
+  // Populate multi-step horizon rollout strip (+1h, +2h, +3h, +6h)
+  const byH = wf.multi_step_forecast?.by_horizon || {};
+  const hKeys = [
+    ["+1h", "fc-h1"],
+    ["+2h", "fc-h2"],
+    ["+3h", "fc-h3"],
+    ["+6h", "fc-h6"],
+  ];
+  hKeys.forEach(([hKey, elId]) => {
+    const item = byH[hKey];
+    if (item) {
+      if (isApd) {
+        setText(elId, `${Number(item.forecast_apd_s).toFixed(2)} s`);
+      } else {
+        setText(elId, `${Number(item.forecast_hs_m).toFixed(2)} m`);
+      }
+    }
+  });
+  if (wf.metrics) {
+    const hw = isApd ? wf.metrics.ci95_halfwidth_apd_s : wf.metrics.ci95_halfwidth_hs_m;
+    const unit = isApd ? "s" : "m";
+    if (hw !== undefined) {
+      setText("fc-ci95", `±${Number(hw).toFixed(2)} ${unit}`);
+    }
   }
 
   const datasets = isApd
@@ -562,6 +758,30 @@ function renderWaveForecastChart(wf) {
         },
       ];
 
+  const upperSeries = isApd ? wf.series.pred_apd_upper_s : wf.series.pred_hs_upper_m;
+  const lowerSeries = isApd ? wf.series.pred_apd_lower_s : wf.series.pred_hs_lower_m;
+  if (Array.isArray(upperSeries) && Array.isArray(lowerSeries)) {
+    datasets.push(
+      {
+        label: "95% MC Dropout CI Upper",
+        data: upperSeries,
+        borderColor: "rgba(56, 189, 248, 0.25)",
+        backgroundColor: "rgba(56, 189, 248, 0.12)",
+        borderWidth: 1,
+        pointRadius: 0,
+        fill: "+1",
+      },
+      {
+        label: "95% MC Dropout CI Lower",
+        data: lowerSeries,
+        borderColor: "rgba(56, 189, 248, 0.25)",
+        borderWidth: 1,
+        pointRadius: 0,
+        fill: false,
+      }
+    );
+  }
+
   if (typeof Chart === "undefined") {
     drawFallbackLineChart(canvas, datasets[0].data, "#0ea5e9");
     return;
@@ -598,11 +818,26 @@ function renderWaterQualityChart(wqa) {
 
   setText("wq-anom-count", `${wqa.flagged_anomalies} Flagged Events`);
 
+  // Populate Panel 4 water quality diagnostics strip
+  setText("wq-latest-mse", wqa.latest_mse !== undefined ? Number(wqa.latest_mse).toFixed(4) : "--");
+  setText("wq-thresh-mse", wqa.threshold_mse !== undefined ? Number(wqa.threshold_mse).toFixed(4) : "--");
+  setText("wq-max-mse", wqa.max_mse !== undefined ? Number(wqa.max_mse).toFixed(3) : "--");
+  const zScore = wqa.uncertainty?.latest_z_score;
+  setText("wq-zscore", zScore !== undefined ? `${zScore >= 0 ? "+" : ""}${Number(zScore).toFixed(2)}σ` : "--");
+  setText(
+    "wq-hypoxic-count",
+    wqa.hypoxic_event_count !== undefined ? `${wqa.hypoxic_event_count} intervals` : "--"
+  );
+
   let datasets = [];
   let yTitle = "Turbidity (NTU)";
 
   if (currentWqMode === "o2") {
     yTitle = "Dissolved Oxygen (mg/L)";
+    setText(
+      "wq-anom-subtitle",
+      "Dissolved Oxygen (O₂ mg/L) with LSTM Autoencoder multi-channel anomaly flags"
+    );
     const anomO2 = wqa.series.o2_ppm.map((v, idx) => (wqa.series.is_anomaly[idx] ? v : null));
     datasets = [
       {
@@ -623,6 +858,10 @@ function renderWaterQualityChart(wqa) {
     ];
   } else if (currentWqMode === "mse") {
     yTitle = "Reconstruction Error (MSE)";
+    setText(
+      "wq-anom-subtitle",
+      `7-Channel LSTM Autoencoder Reconstruction MSE vs. 95th Percentile Threshold (${wqa.threshold_mse})`
+    );
     const threshLine = wqa.series.recon_mse.map(() => wqa.threshold_mse);
     datasets = [
       {
@@ -644,6 +883,10 @@ function renderWaterQualityChart(wqa) {
       },
     ];
   } else {
+    setText(
+      "wq-anom-subtitle",
+      "Unsupervised detection of estuarine sediment/turbidity plumes & hypoxic dips"
+    );
     const anomPoints = wqa.series.turbidity_ntu.map((v, idx) => (wqa.series.is_anomaly[idx] ? v : null));
     datasets = [
       {
@@ -693,7 +936,7 @@ async function loadVisionSamples() {
     const data = await fetchJson("/api/vision/samples");
     allSamples = data.samples || [];
     if (data.modes) {
-      availableServerModes = Object.keys(data.modes);
+      availableServerModes = Array.from(new Set([...Object.keys(data.modes), "all", "ensemble"]));
     }
 
     const strip = document.getElementById("sample-strip");
@@ -736,6 +979,7 @@ async function loadVisionSamples() {
 
 async function runSampleDetection(sampleId) {
   if (!sampleId) return;
+  const reqId = ++visionRequestSeq;
   currentSampleId = sampleId;
   currentUploadFile = null;
   updateUploadBadge(null);
@@ -746,38 +990,49 @@ async function runSampleDetection(sampleId) {
   });
 
   const conf = getValidConfidence();
+  const modeAtStart = currentVisionMode;
+  const isEnsemble = modeAtStart === "ensemble" || modeAtStart === "all";
   setVisionLoading(
     true,
-    currentVisionMode === "ensemble"
+    isEnsemble
       ? "Running Multi-Model YOLOv11m Ensemble Fusion..."
       : "Running YOLOv11m Inference..."
   );
 
   try {
     let data;
-    if (currentVisionMode === "ensemble" && !availableServerModes.includes("ensemble")) {
-      data = await runClientEnsembleOnSample(sampleId, conf);
-    } else {
+    if (isEnsemble) {
+      const serverEnsMode = availableServerModes.includes("all")
+        ? "all"
+        : availableServerModes.includes("ensemble")
+          ? "ensemble"
+          : "all";
       try {
         data = await fetchJson("/api/vision/detect-sample", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sample_id: sampleId, mode: currentVisionMode, conf }),
+          body: JSON.stringify({ sample_id: sampleId, mode: serverEnsMode, conf }),
         });
-      } catch (err) {
-        if (currentVisionMode === "ensemble") {
-          data = await runClientEnsembleOnSample(sampleId, conf);
-        } else {
-          throw err;
-        }
+      } catch (_err) {
+        data = await runClientEnsembleOnSample(sampleId, conf);
       }
+    } else {
+      data = await fetchJson("/api/vision/detect-sample", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sample_id: sampleId, mode: modeAtStart, conf }),
+      });
     }
+    if (reqId !== visionRequestSeq) return;
     renderVisionResult(data);
   } catch (err) {
+    if (reqId !== visionRequestSeq) return;
     showVisionError(`Sample detection failed: ${err.message}`);
     showStatusBanner(`Vision inference error: ${err.message}`, "error");
   } finally {
-    setVisionLoading(false);
+    if (reqId === visionRequestSeq) {
+      setVisionLoading(false);
+    }
   }
 }
 
@@ -789,47 +1044,59 @@ async function runUploadDetection(file) {
     return;
   }
 
+  const reqId = ++visionRequestSeq;
   currentUploadFile = file;
   updateUploadBadge(file.name);
   hideVisionError();
   document.querySelectorAll(".sample-chip").forEach((c) => c.classList.remove("active"));
 
   const conf = getValidConfidence();
+  const modeAtStart = currentVisionMode;
+  const isEnsemble = modeAtStart === "ensemble" || modeAtStart === "all";
   setVisionLoading(
     true,
-    currentVisionMode === "ensemble"
+    isEnsemble
       ? `Running Ensemble Fusion on ${file.name}...`
       : `Analyzing ${file.name}...`
   );
 
   try {
     let data;
-    if (currentVisionMode === "ensemble" && !availableServerModes.includes("ensemble")) {
-      data = await runClientEnsembleOnUpload(file, conf);
-    } else {
+    if (isEnsemble) {
+      // Backend POST /api/vision/detect-upload natively supports mode="ensemble" / "all" via _ModelSpecsRegistry.__contains__
+      const preferredServerMode = availableServerModes.includes("all") ? "all" : "ensemble";
       try {
         const formData = new FormData();
         formData.append("file", file);
-        formData.append("mode", currentVisionMode);
+        formData.append("mode", preferredServerMode);
         formData.append("conf", String(conf));
         data = await fetchJson("/api/vision/detect-upload", {
           method: "POST",
           body: formData,
         });
-      } catch (err) {
-        if (currentVisionMode === "ensemble") {
-          data = await runClientEnsembleOnUpload(file, conf);
-        } else {
-          throw err;
-        }
+      } catch (_err) {
+        data = await runClientEnsembleOnUpload(file, conf);
       }
+    } else {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("mode", modeAtStart);
+      formData.append("conf", String(conf));
+      data = await fetchJson("/api/vision/detect-upload", {
+        method: "POST",
+        body: formData,
+      });
     }
+    if (reqId !== visionRequestSeq) return;
     renderVisionResult(data);
   } catch (err) {
+    if (reqId !== visionRequestSeq) return;
     showVisionError(`Upload inference failed: ${err.message}`);
     showStatusBanner(`Upload inference error: ${err.message}`, "error");
   } finally {
-    setVisionLoading(false);
+    if (reqId === visionRequestSeq) {
+      setVisionLoading(false);
+    }
   }
 }
 
@@ -879,27 +1146,31 @@ function computeBoxIoU(boxA, boxB) {
 
 async function fuseEnsembleResults([horizonRes, buoyRes, colregsRes, sarRes], wallMs) {
   const trackSources = [
-    { res: buoyRes, track: "Buoy", color: "#0ea5e9" },
-    { res: colregsRes, track: "COLREGs", color: "#10b981" },
-    { res: sarRes, track: "SAR", color: "#f43f5e" },
+    { res: buoyRes, track: "Buoy", source_model: "buoy", color: "#0ea5e9" },
+    { res: colregsRes, track: "COLREGs", source_model: "colregs", color: "#10b981" },
+    { res: sarRes, track: "SAR", source_model: "sar", color: "#f43f5e" },
   ];
 
   const candidates = [];
-  trackSources.forEach(({ res, track, color }) => {
-    (res.detections || []).forEach((d) => {
+  trackSources.forEach(({ res, track, source_model, color }) => {
+    (res?.detections || []).forEach((d) => {
       candidates.push({
         ...d,
+        source_model: d.source_model || source_model,
         track,
         track_color: color,
       });
     });
   });
 
-  // Sort by confidence descending and run cross-model NMS (IoU > 0.52)
+  // Sort by confidence descending and run cross-model NMS matching backend _deduplicate_ensemble_boxes (0.45 same-class, 0.60 cross-class)
   candidates.sort((a, b) => b.confidence - a.confidence);
   const fused = [];
   candidates.forEach((cand) => {
-    const duplicate = fused.some((existing) => computeBoxIoU(existing.bbox, cand.bbox) > 0.52);
+    const duplicate = fused.some((existing) => {
+      const thresh = existing.class_name === cand.class_name ? 0.45 : 0.60;
+      return computeBoxIoU(existing.bbox, cand.bbox) >= thresh;
+    });
     if (!duplicate) {
       fused.push({
         ...cand,
@@ -907,6 +1178,59 @@ async function fuseEnsembleResults([horizonRes, buoyRes, colregsRes, sarRes], wa
       });
     }
   });
+
+  // Recompute unified COLREGs / SAR frame risk summary across all deduplicated fused detections
+  const countsByLevel = { CRITICAL: 0, WARNING: 0, CAUTION: 0, NOMINAL: 0 };
+  const countsBySector = {};
+  let sarTargetsCount = 0;
+  let collisionWatchCount = 0;
+  let highestTarget = null;
+  let maxRiskScore = 0;
+
+  fused.forEach((d) => {
+    const lvl = (d.risk_level || "NOMINAL").toUpperCase();
+    const sec = d.sector || "Bow";
+    const score = Number(d.risk_score ?? 0);
+    countsByLevel[lvl] = (countsByLevel[lvl] || 0) + 1;
+    countsBySector[sec] = (countsBySector[sec] || 0) + 1;
+    if (d.is_sar_target) sarTargetsCount += 1;
+    if (lvl === "CRITICAL" || lvl === "WARNING") collisionWatchCount += 1;
+    if (!highestTarget || score > maxRiskScore) {
+      maxRiskScore = score;
+      highestTarget = d;
+    }
+  });
+
+  let overallStatus = "CLEAR";
+  let advisory = "All optical azimuth sectors clear. Maintain standard COLREGs Rule 5 look-out.";
+  if (fused.length > 0) {
+    if (countsByLevel.CRITICAL > 0) {
+      overallStatus = "CRITICAL";
+      advisory = highestTarget?.recommended_action || advisory;
+    } else if (countsByLevel.WARNING > 0) {
+      overallStatus = "WARNING";
+      advisory = highestTarget?.recommended_action || advisory;
+    } else if (countsByLevel.CAUTION > 0) {
+      overallStatus = "CAUTION";
+      advisory = highestTarget?.recommended_action || advisory;
+    } else {
+      overallStatus = "NOMINAL";
+      advisory = `${fused.length} target(s) tracked at safe range across multi-model ensemble. Continue routine radar/optical watch.`;
+    }
+  }
+
+  const bestRiskSummary = {
+    overall_status: overallStatus,
+    max_risk_score: Math.round(maxRiskScore * 10) / 10,
+    total_targets: fused.length,
+    sar_alert_active: sarTargetsCount > 0,
+    sar_targets_count: sarTargetsCount,
+    collision_watch_count: collisionWatchCount,
+    counts_by_level: countsByLevel,
+    counts_by_sector: countsBySector,
+    highest_priority_target: highestTarget,
+    advisory,
+  };
 
   const compositedImage = await drawEnsembleOverlay(
     horizonRes.image_base64,
@@ -919,16 +1243,18 @@ async function fuseEnsembleResults([horizonRes, buoyRes, colregsRes, sarRes], wa
     model_title: "Type 5: Multi-Model Ensemble Fusion (Buoy + COLREGs + SAR + 3-Zone Horizon HUD)",
     dataset: "Unified KS_Buoy + SPSCD/SMD + AFO-SAR + RANSAC Horizon",
     benchmark_metrics: {
-      precision: 87.59,
-      recall: 79.52,
-      map50: 84.52,
-      map50_95: 51.93,
+      precision: 85.43,
+      recall: 76.06,
+      map50: 81.34,
+      map50_95: 47.88,
     },
     inference_ms: Math.round(wallMs * 10) / 10,
     resolution: horizonRes.resolution,
     attitude: horizonRes.attitude,
     total_detections: fused.length,
     detections: fused,
+    risk_summary: bestRiskSummary,
+    colregs_risk: bestRiskSummary,
     image_base64: compositedImage,
   };
 }
@@ -958,9 +1284,11 @@ function drawEnsembleOverlay(base64Src, resolution, detections) {
           ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
           const sign = det.bearing_deg >= 0 ? "+" : "";
-          const label = `[${det.track || "ENS"}] ${det.class_name} ${det.confidence_pct.toFixed(0)}% | ${sign}${det.bearing_deg.toFixed(1)}°`;
-          ctx.font = "bold 12px 'JetBrains Mono', monospace";
-          const tw = Math.max(125, ctx.measureText(label).width + 12);
+          const riskLvl = det.risk_level || "NOMINAL";
+          const label = `[${det.track || "ENS"}] ${det.class_name} ${det.confidence_pct.toFixed(0)}% | ${sign}${det.bearing_deg.toFixed(1)}° | ${riskLvl}`;
+          const underlyingLabelLen = `${det.class_name} ${det.confidence_pct.toFixed(0)}% | ${sign}${det.bearing_deg.toFixed(1)}° | ${riskLvl}`.length;
+          ctx.font = "bold 11px 'JetBrains Mono', monospace";
+          const tw = Math.max(125, ctx.measureText(label).width + 14, underlyingLabelLen * 6 + 14);
           const ty = Math.max(0, y1 - 22);
           ctx.fillStyle = color;
           ctx.fillRect(x1, ty, Math.min(W - x1, tw), 22);
@@ -1049,6 +1377,32 @@ function renderVisionResult(data) {
     `Roll: ${rollSign}${Number(att.roll_deg).toFixed(2)}° | Pitch: ${pitchSign}${Number(att.pitch_offset_pct).toFixed(1)}% | Water: ${Number(att.water_ratio_pct).toFixed(0)}%`
   );
 
+  // Update COLREGs / SAR Risk Advisory bar
+  const risk = data.risk_summary || data.colregs_risk;
+  const statusPill = document.getElementById("colregs-status-pill");
+  const advBar = document.getElementById("colregs-advisory-bar");
+  if (risk) {
+    const st = (risk.overall_status || "NOMINAL").toUpperCase();
+    if (statusPill) {
+      statusPill.textContent = `RISK: ${st}${risk.max_risk_score ? ` (${Number(risk.max_risk_score).toFixed(0)})` : ""}`;
+      statusPill.className = `risk-pill risk-${st.toLowerCase()}`;
+    }
+    if (advBar) {
+      advBar.textContent = risk.advisory || "Standard maritime watch active.";
+    }
+  } else {
+    if (statusPill) {
+      statusPill.textContent = detTotal > 0 ? "STATUS: TRACKING" : "STATUS: CLEAR";
+      statusPill.className = "risk-pill risk-nominal";
+    }
+    if (advBar) {
+      advBar.textContent =
+        detTotal > 0
+          ? `${detTotal} maritime target(s) tracked within optical FOV.`
+          : "All optical azimuth sectors clear. Maintain standard COLREGs Rule 5 look-out.";
+    }
+  }
+
   // Populate detection table
   const tbody = document.getElementById("det-tbody");
   const detections = data.detections || [];
@@ -1056,16 +1410,30 @@ function renderVisionResult(data) {
     if (detections.length === 0) {
       tbody.innerHTML = `<tr><td colspan="5" class="empty-row">No targets above confidence threshold</td></tr>`;
     } else {
+      const trackColorMap = {
+        buoy: "#0ea5e9",
+        colregs: "#10b981",
+        sar: "#f43f5e",
+        horizon: "#f59e0b",
+      };
       tbody.innerHTML = detections
         .map((d) => {
-          const trackBadge = d.track
-            ? `<span class="track-badge" style="background:${d.track_color || "#0ea5e9"}33;color:${d.track_color || "#38bdf8"};border:1px solid ${d.track_color || "#0ea5e9"}66">${escapeHtml(d.track)}</span>`
+          const trackLabel = d.track || (d.source_model && d.source_model !== data.mode ? d.source_model.toUpperCase() : "");
+          const tColor = d.track_color || trackColorMap[d.source_model] || "#0ea5e9";
+          const trackBadge = trackLabel
+            ? `<span class="track-badge" style="background:${tColor}33;color:${tColor};border:1px solid ${tColor}66">${escapeHtml(trackLabel)}</span>`
             : "";
+          const riskLvl = d.risk_level ? d.risk_level.toUpperCase() : "";
+          const riskBadge =
+            riskLvl && riskLvl !== "NOMINAL"
+              ? ` <span class="risk-pill risk-${riskLvl.toLowerCase()}">${escapeHtml(riskLvl)}</span>`
+              : "";
           const brgSign = d.bearing_deg >= 0 ? "+" : "";
+          const rowTitle = d.recommended_action ? ` title="${escapeHtml(d.recommended_action)}"` : "";
           return `
-        <tr>
+        <tr${rowTitle}>
           <td class="mono">${d.id}</td>
-          <td>${trackBadge}<strong>${escapeHtml(d.class_name)}</strong></td>
+          <td>${trackBadge}<strong>${escapeHtml(d.class_name)}</strong>${riskBadge}</td>
           <td class="mono">${Number(d.confidence_pct).toFixed(1)}%</td>
           <td class="mono" style="color:#38bdf8">${brgSign}${Number(d.bearing_deg).toFixed(1)}°</td>
           <td class="mono">${Number(d.est_range_m).toFixed(1)} m</td>
@@ -1077,6 +1445,25 @@ function renderVisionResult(data) {
 
   drawRadarHUD(detections);
   drawHorizonGyro(Number(att.roll_deg || 0), Number(att.pitch_offset_pct || 0));
+}
+
+function resolveRadarBlipColor(det) {
+  if (det.track_color) return det.track_color;
+  const riskLvl = (det.risk_level || "").toUpperCase();
+  if (riskLvl === "CRITICAL") return "#f43f5e";
+  if (riskLvl === "WARNING") return "#f59e0b";
+  const srcColors = {
+    buoy: "#0ea5e9",
+    colregs: "#10b981",
+    sar: "#f43f5e",
+    horizon: "#f59e0b",
+  };
+  if (det.source_model && srcColors[det.source_model]) {
+    return srcColors[det.source_model];
+  }
+  if (riskLvl === "CAUTION") return "#38bdf8";
+  if (riskLvl === "NOMINAL") return "#10b981";
+  return "#f43f5e";
 }
 
 function drawRadarHUD(detections) {
@@ -1153,7 +1540,7 @@ function drawRadarHUD(detections) {
     const tx = cx + r * Math.cos(rad);
     const ty = cy + r * Math.sin(rad);
 
-    const blipColor = d.track_color || "#f43f5e";
+    const blipColor = resolveRadarBlipColor(d);
     // Target pulse ring
     ctx.strokeStyle = blipColor;
     ctx.lineWidth = 1.2;
@@ -1169,7 +1556,8 @@ function drawRadarHUD(detections) {
     ctx.fillStyle = "#f8fafc";
     ctx.font = "10px 'JetBrains Mono', monospace";
     const sign = d.bearing_deg >= 0 ? "+" : "";
-    ctx.fillText(`${sign}${d.bearing_deg.toFixed(0)}°`, tx + 8, ty + 3);
+    const labelX = Math.min(W - 34, Math.max(4, tx + 8));
+    ctx.fillText(`${sign}${d.bearing_deg.toFixed(0)}°`, labelX, ty + 3);
   });
 
   // Buoy origin marker
@@ -1207,7 +1595,9 @@ function drawHorizonGyro(rollDeg, pitchPct) {
   ctx.clip();
 
   const rad = (rollDeg * Math.PI) / 180;
-  const yOffset = (pitchPct / 100) * radius;
+  // Positive pitch_offset_pct = (0.5 - horizon_mid_y / H) * 100 means horizon is above midpoint (more water visible -> negative canvas yOffset)
+  const clampedPitch = Math.max(-45, Math.min(45, Number(pitchPct) || 0));
+  const yOffset = -((clampedPitch / 100) * radius * 1.6);
 
   ctx.translate(cx, cy + yOffset);
   ctx.rotate(rad);
@@ -1241,6 +1631,18 @@ function drawHorizonGyro(rollDeg, pitchPct) {
 
   ctx.restore();
 
+  // Roll scale bezel ticks (-30, -15, 0, +15, +30 deg)
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.7)";
+  ctx.lineWidth = 1.2;
+  [-30, -15, 0, 15, 30].forEach((deg) => {
+    const a = ((deg - 90) * Math.PI) / 180;
+    const rIn = deg === 0 ? radius - 6 : radius - 4;
+    ctx.beginPath();
+    ctx.moveTo(cx + rIn * Math.cos(a), cy + rIn * Math.sin(a));
+    ctx.lineTo(cx + radius * Math.cos(a), cy + radius * Math.sin(a));
+    ctx.stroke();
+  });
+
   // Fixed Buoy Reticle Wings at center
   ctx.strokeStyle = "#f8fafc";
   ctx.lineWidth = 2;
@@ -1268,10 +1670,20 @@ function connectLiveWebSocket() {
   const wsPill = document.getElementById("ws-status");
   const wsText = document.getElementById("ws-text");
 
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+
+  if (activeWebSocket && activeWebSocket.readyState <= 1) {
+    return;
+  }
+
   let ws;
   try {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${proto}//${location.host}/ws/live`);
+    activeWebSocket = ws;
   } catch (_err) {
     if (wsPill) wsPill.className = "ws-pill offline";
     if (wsText) wsText.textContent = "WS OFFLINE";
@@ -1299,6 +1711,26 @@ function connectLiveWebSocket() {
       if (msg.timestamp) {
         setText("kpi-imu-time", msg.timestamp);
       }
+
+      // Populate fallback KPI values if REST /api/telemetry has not yet completed
+      const hsEl = document.getElementById("kpi-hs");
+      if (hsEl && hsEl.textContent === "-- m" && msg.met) {
+        setText("kpi-hs", `${Number(msg.met.wvht_m ?? 0).toFixed(2)} m`);
+        setText("kpi-tp", `${Number(msg.met.dpd_s ?? 0).toFixed(1)} s`);
+        setText("kpi-wind", `${Number(msg.met.wspd_mps ?? 0).toFixed(1)} m/s`);
+        setText(
+          "kpi-pres",
+          `Gust: ${Number(msg.met.gst_mps ?? 0).toFixed(1)} m/s • Baro: ${Number(msg.met.pres_hpa ?? 0).toFixed(1)} hPa`
+        );
+      }
+      const wqEl = document.getElementById("kpi-wq");
+      if (wqEl && wqEl.textContent === "-- mg/L O₂" && msg.wq) {
+        setText("kpi-wq", `${Number(msg.wq.o2_ppm ?? 0).toFixed(2)} mg/L O₂`);
+        setText(
+          "kpi-wq-sub",
+          `Turb: ${Number(msg.wq.turb_ntu ?? 0).toFixed(1)} NTU • Sal: ${Number(msg.wq.sal_psu ?? 0).toFixed(1)} PSU • pH: ${Number(msg.wq.ph ?? 0).toFixed(2)}`
+        );
+      }
     } catch (_err) {
       // Ignore malformed frame
     }
@@ -1309,11 +1741,12 @@ function connectLiveWebSocket() {
   };
 
   ws.onclose = () => {
+    activeWebSocket = null;
     wsReconnectAttempts += 1;
     if (wsPill) wsPill.className = "ws-pill reconnecting";
     if (wsText) wsText.textContent = "RECONNECTING...";
     const delay = Math.min(10000, 2000 * Math.pow(1.3, Math.min(wsReconnectAttempts, 5)));
-    setTimeout(connectLiveWebSocket, delay);
+    wsReconnectTimer = setTimeout(connectLiveWebSocket, delay);
   };
 }
 

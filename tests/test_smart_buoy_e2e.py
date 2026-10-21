@@ -233,3 +233,105 @@ def test_websocket_live_imu_stream() -> None:
         assert "imu" in msg and "heave_m" in msg["imu"]
         assert "met" in msg and "wvht_m" in msg["met"]
         assert "wq" in msg and "o2_ppm" in msg["wq"]
+
+
+def test_telemetry_refresh_rejects_truncated_or_html_payload() -> None:
+    """Verify POST /api/telemetry/refresh does not overwrite cached NOAA data when upstream returns HTML or truncated HTTP 200."""
+    from unittest.mock import MagicMock, patch
+    from app.telemetry import DATA_DIR
+
+    spec_file = DATA_DIR / "46050.data_spec"
+    orig_size = spec_file.stat().st_size
+
+    mock_resp = MagicMock()
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.read.return_value = b"<html>503 Service Temporarily Unavailable</html>"
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = client.post("/api/telemetry/refresh")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "refreshed"
+    assert body["telemetry"]["met_ocean"]["total_records"] > 6000
+    assert spec_file.stat().st_size == orig_size
+
+
+def test_vision_detect_sample_supports_all_and_ensemble_modes() -> None:
+    """Verify POST /api/vision/detect-sample accepts mode='all' and mode='ensemble' symmetrically with detect-upload."""
+    for mode_alias in ("all", "ensemble"):
+        res = client.post(
+            "/api/vision/detect-sample",
+            json={"sample_id": "buoy/buoy_sample_1_buoy_00022.png", "mode": mode_alias, "conf": 0.25},
+        )
+        assert res.status_code == 200
+        payload = res.json()
+        assert payload["mode"] == "all"
+        assert payload["sample_id"] == "buoy/buoy_sample_1_buoy_00022.png"
+        assert payload["active_models"] == [
+            "yolo11m_ks_buoy.pt",
+            "yolo11m_spscd_vessels.pt",
+            "yolo11m_afo_sar.pt",
+        ]
+        assert payload["total_detections"] >= 1
+
+
+def test_vision_16bit_grayscale_tiff_and_extreme_aspect_ratios() -> None:
+    """Verify 16-bit grayscale TIFF (I;16) dynamic range normalization and narrow/wide image HUD clamping."""
+    import numpy as np
+    from app.vision import MarineVisionEngine
+
+    arr16 = np.zeros((160, 240), dtype=np.uint16)
+    arr16[:80, :] = 48000  # Bright sky
+    arr16[80:, :] = 12000  # Darker sea
+    img16 = Image.fromarray(arr16)
+    buf16 = io.BytesIO()
+    img16.save(buf16, format="TIFF")
+
+    _, rgb16 = MarineVisionEngine._decode_rgb_image(buf16.getvalue())
+    assert rgb16.dtype == np.uint8
+    assert float(rgb16[:80].mean()) > 180.0
+    assert float(rgb16[80:].mean()) < 60.0
+
+    res_tiff = client.post(
+        "/api/vision/detect-upload",
+        files={"file": ("sar_16bit.tiff", buf16.getvalue(), "image/tiff")},
+        data={"mode": "horizon", "conf": "0.25"},
+    )
+    assert res_tiff.status_code == 200
+    assert 35.0 <= res_tiff.json()["attitude"]["water_ratio_pct"] <= 65.0
+
+    for width, height in ((10, 4000), (4000, 10)):
+        extreme_img = Image.new("RGB", (width, height), color=(25, 85, 135))
+        ebuf = io.BytesIO()
+        extreme_img.save(ebuf, format="PNG")
+        res_ext = client.post(
+            "/api/vision/detect-upload",
+            files={"file": (f"extreme_{width}x{height}.png", ebuf.getvalue(), "image/png")},
+            data={"mode": "buoy", "conf": "0.05"},
+        )
+        assert res_ext.status_code == 200
+        assert res_ext.json()["resolution"] == {"width": width, "height": height}
+
+
+def test_concurrent_forecast_and_vision_thread_safety() -> None:
+    """Verify concurrent threads invoking BuoyTimeSeriesEngine and MarineVisionEngine do not race."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    img = Image.new("RGB", (240, 160), color=(30, 95, 145))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw_bytes = buf.getvalue()
+
+    def _worker(idx: int) -> float:
+        if idx % 2 == 0:
+            fc = timeseries_engine.evaluate_and_forecast(telemetry_store)
+            return float(fc["wave_forecast"]["live_prediction"]["forecast_hs_1h_m"])
+        det = vision_engine.run_detection(raw_bytes, mode="horizon", conf_threshold=0.25)
+        return float(det["attitude"]["water_ratio_pct"])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_worker, range(8)))
+    assert len(results) == 8
+    assert all(r >= 0.0 for r in results)
+

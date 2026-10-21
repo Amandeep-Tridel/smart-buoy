@@ -102,14 +102,40 @@ def test_engine_initialization_and_eval_mode(ts_engine: BuoyTimeSeriesEngine) ->
     assert next(ts_engine.ae_model.parameters()).device == ts_engine.device
 
 
+def test_predict_with_uncertainty_mc_dropout(ts_engine: BuoyTimeSeriesEngine) -> None:
+    """Verify ResidualWaveForecaster.predict_with_uncertainty for mc_samples=1 and mc_samples=16."""
+    model = ts_engine.wave_model
+    x = torch.randn(2, 36, len(MET_COLS), device=ts_engine.device)
+    base = torch.tensor([[2.4, 8.5], [3.8, 11.0]], dtype=torch.float32, device=ts_engine.device)
+
+    # mc_samples=1 -> deterministic prediction and zero epistemic uncertainty
+    det_1, std_1 = model.predict_with_uncertainty(x, base, mc_samples=1)
+    assert det_1.shape == (2, 2)
+    assert std_1.shape == (2, 2)
+    np.testing.assert_allclose(std_1, 0.0, atol=1e-12)
+
+    # mc_samples=16 -> stochastic LSTM dropout passes produce positive epistemic std and restore eval mode
+    det_16, std_16 = model.predict_with_uncertainty(x, base, mc_samples=16)
+    assert not model.training
+    assert not model.lstm.training
+    np.testing.assert_allclose(det_16, det_1, rtol=1e-6, atol=1e-6)
+    assert np.all(std_16 > 0.0)
+
+    # Seeded MC Dropout passes must be reproducible across identical invocations
+    det_16_b, std_16_b = model.predict_with_uncertainty(x, base, mc_samples=16)
+    np.testing.assert_allclose(det_16, det_16_b, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(std_16, std_16_b, rtol=1e-6, atol=1e-6)
+
+
 def test_evaluate_and_forecast_on_real_noaa_data(
     ts_engine: BuoyTimeSeriesEngine,
     telemetry_store: BuoyTelemetryStore,
 ) -> None:
-    """Verify full wave forecasting and water quality anomaly evaluation on real NOAA 46050 & ACQS1 data."""
+    """Verify full wave forecasting, multi-step rollout, uncertainty, WQ anomaly, and alerts on real NOAA data."""
     result = ts_engine.evaluate_and_forecast(telemetry_store)
     assert "wave_forecast" in result
     assert "water_quality_anomaly" in result
+    assert "alerts" in result
 
     # 1. Wave Forecast checks
     wf = result["wave_forecast"]
@@ -126,11 +152,35 @@ def test_evaluate_and_forecast_on_real_noaa_data(
     assert 1.0 < live["forecast_apd_1h_s"] < 30.0
     assert abs((live["forecast_hs_1h_m"] - live["current_hs_m"]) - live["delta_hs_m"]) <= 0.02
     assert abs((live["forecast_apd_1h_s"] - live["current_apd_s"]) - live["delta_apd_s"]) <= 0.02
+    assert live["ci95_lower_hs_m"] <= live["forecast_hs_1h_m"] <= live["ci95_upper_hs_m"]
+    assert live["ci95_lower_apd_s"] <= live["forecast_apd_1h_s"] <= live["ci95_upper_apd_s"]
+
+    # Multi-step forecast (+1h, +2h, +3h, +6h) checks
+    ms = wf["multi_step_forecast"]
+    assert ms["horizons_hours"] == [1, 2, 3, 6]
+    assert set(ms["by_horizon"].keys()) == {"+1h", "+2h", "+3h", "+6h"}
+    stds_hs = [h["uncertainty_std_hs_m"] for h in ms["horizons"]]
+    assert stds_hs[0] < stds_hs[-1], "Expected multi-step uncertainty to grow with forecast horizon"
+
+    # Uncertainty metadata checks
+    unc = wf["uncertainty"]
+    assert unc["confidence_level"] == 0.95
+    assert unc["mc_dropout_samples"] == 16
+    assert unc["combined_std_hs_m"] >= unc["aleatoric_std_hs_m"]
 
     wf_series = wf["series"]
     n_val = len(wf_series["timestamps"])
     assert 50 <= n_val <= 360
-    for key in ("true_hs_m", "pred_hs_m", "true_apd_s", "pred_apd_s"):
+    for key in (
+        "true_hs_m",
+        "pred_hs_m",
+        "pred_hs_upper_m",
+        "pred_hs_lower_m",
+        "true_apd_s",
+        "pred_apd_s",
+        "pred_apd_upper_s",
+        "pred_apd_lower_s",
+    ):
         assert len(wf_series[key]) == n_val
 
     # 2. Water Quality Anomaly checks
@@ -144,11 +194,22 @@ def test_evaluate_and_forecast_on_real_noaa_data(
     assert wqa["latest_mse"] >= 0.0
     assert isinstance(wqa["latest_is_anomaly"], bool)
 
+    # Channel MSE breakdown across all 7 sonde features
+    breakdown = wqa["channel_mse_breakdown"]
+    assert set(breakdown.keys()) == set(WQ_COLS)
+    total_share = sum(v["share_pct"] for v in breakdown.values())
+    assert 99.0 <= total_share <= 101.0
+
     wqa_series = wqa["series"]
     n_anom_pts = len(wqa_series["timestamps"])
     assert 50 <= n_anom_pts <= 350
     for key in ("turbidity_ntu", "o2_ppm", "recon_mse", "is_anomaly"):
         assert len(wqa_series[key]) == n_anom_pts
+
+    # 3. Alerts evaluation consistency
+    alerts = ts_engine.evaluate_alerts(telemetry_store)
+    assert alerts == result["alerts"]
+    assert "active_alerts" in alerts and "alerts" in alerts and "categories" in alerts
 
 
 def test_water_quality_ae_detects_synthetic_spike(
@@ -161,6 +222,7 @@ def test_water_quality_ae_detects_synthetic_spike(
     normal_mask = raw_wq[:, 5] < np.percentile(raw_wq[:, 5], 85)
     mean_w = raw_wq[normal_mask].mean(axis=0)
     std_w = raw_wq[normal_mask].std(axis=0) + 1e-6
+    assert mean_w.shape == (len(WQ_COLS),) and std_w.shape == (len(WQ_COLS),)
 
     # Construct a calm baseline window near the normal mean vs. an extreme anomaly spike
     calm_window = np.zeros((1, 16, len(WQ_COLS)), dtype=np.float32)
@@ -176,3 +238,30 @@ def test_water_quality_ae_detects_synthetic_spike(
 
     assert mse_spiked > mse_calm * 10.0
     assert mse_spiked > 5.0
+
+
+def test_evaluate_and_forecast_tiny_and_empty_dataframe_edge_cases(
+    ts_engine: BuoyTimeSeriesEngine,
+    telemetry_store: BuoyTelemetryStore,
+) -> None:
+    """Verify adaptive lookback/window handling on tiny DataFrames and ValueError on empty DataFrames."""
+    import copy
+
+    assert telemetry_store.df_met is not None and telemetry_store.df_wq is not None
+
+    # 1. Tiny DataFrames (10 met rows < 44 standard lookback+horizon; 8 wq rows < 16 window)
+    tiny_store = copy.copy(telemetry_store)
+    tiny_store.df_met = telemetry_store.df_met.iloc[:10].copy().reset_index(drop=True)
+    tiny_store.df_wq = telemetry_store.df_wq.iloc[:8].copy().reset_index(drop=True)
+
+    tiny_res = ts_engine.evaluate_and_forecast(tiny_store)
+    assert tiny_res["wave_forecast"]["lookback_steps"] == 5
+    assert tiny_res["wave_forecast"]["live_prediction"]["forecast_hs_1h_m"] > 0.0
+    assert tiny_res["water_quality_anomaly"]["total_windows"] >= 1
+
+    # 2. Empty DataFrame raises ValueError
+    empty_store = copy.copy(telemetry_store)
+    empty_store.df_met = telemetry_store.df_met.iloc[0:0].copy()
+    with pytest.raises(ValueError, match="must not be empty"):
+        ts_engine.evaluate_and_forecast(empty_store)
+

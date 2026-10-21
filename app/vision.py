@@ -2,6 +2,7 @@
 
 import base64
 import io
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -117,16 +118,56 @@ class MarineVisionEngine:
 
     def __init__(self) -> None:
         self._models: Dict[str, Any] = {}
+        self._lock = threading.RLock()
         self.risk_evaluator = COLREGsRiskEvaluator()
 
     def _get_yolo(self, weight_filename: str) -> Any:
-        if weight_filename not in self._models:
-            from ultralytics import YOLO
-            wpath = WEIGHTS_DIR / weight_filename
-            if not wpath.exists():
-                raise FileNotFoundError(f"Missing YOLOv11m weight file: {wpath}")
-            self._models[weight_filename] = YOLO(str(wpath))
-        return self._models[weight_filename]
+        with self._lock:
+            if weight_filename not in self._models:
+                from ultralytics import YOLO
+                wpath = WEIGHTS_DIR / weight_filename
+                if not wpath.exists():
+                    raise FileNotFoundError(f"Missing YOLOv11m weight file: {wpath}")
+                self._models[weight_filename] = YOLO(str(wpath))
+            return self._models[weight_filename]
+
+    @staticmethod
+    def _decode_rgb_image(image_bytes: bytes) -> Tuple[Image.Image, np.ndarray]:
+        """Decode image bytes to an 8-bit RGB PIL Image and (H, W, 3) uint8 ndarray, normalizing 16-bit/float modes."""
+        try:
+            raw_img = Image.open(io.BytesIO(image_bytes))
+            raw_img.load()
+        except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
+            raise ValueError(f"Invalid or corrupted image file: {exc}") from exc
+
+        W, H = raw_img.size
+        if H < 8 or W < 8:
+            raise ValueError(f"Image dimensions ({W}x{H}) are too small; minimum supported size is 8x8 pixels.")
+
+        arr = np.asarray(raw_img)
+        if raw_img.mode in ("I;16", "I;16L", "I;16B", "I", "F") or (arr.ndim >= 2 and arr.dtype != np.uint8):
+            arr_f = np.nan_to_num(arr.astype(np.float64), nan=0.0, posinf=255.0, neginf=0.0)
+            vmin = float(arr_f.min())
+            vmax = float(arr_f.max())
+            if vmax > vmin:
+                if vmin >= 0.0 and vmax <= 65535.0 and raw_img.mode.startswith("I;16") and (vmax - vmin) > 255.0:
+                    norm_u8 = np.clip((arr_f - vmin) / (vmax - vmin) * 255.0, 0.0, 255.0).astype(np.uint8)
+                else:
+                    norm_u8 = np.clip((arr_f - vmin) / (vmax - vmin) * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                norm_u8 = np.clip(arr_f, 0.0, 255.0).astype(np.uint8)
+            if norm_u8.ndim == 2:
+                rgb = np.stack([norm_u8, norm_u8, norm_u8], axis=-1)
+            elif norm_u8.ndim == 3 and norm_u8.shape[2] >= 3:
+                rgb = norm_u8[:, :, :3]
+            else:
+                rgb = np.stack([norm_u8.squeeze()] * 3, axis=-1)
+            pil_img = Image.fromarray(rgb)
+            return pil_img, rgb
+
+        pil_img = raw_img.convert("RGB")
+        rgb = np.array(pil_img, dtype=np.uint8)
+        return pil_img, rgb
 
     def list_samples(self) -> List[Dict[str, Any]]:
         """List all bundled real-world validation frames across buoy, colregs, and sar."""
@@ -158,6 +199,8 @@ class MarineVisionEngine:
         """Estimate sea-sky horizon line y = slope * x + intercept via robust column gradient fit."""
         if rgb.ndim == 2:
             rgb = np.stack([rgb, rgb, rgb], axis=-1)
+        elif rgb.ndim == 3 and rgb.shape[2] == 1:
+            rgb = np.repeat(rgb, 3, axis=-1)
         H, W = int(rgb.shape[0]), int(rgb.shape[1])
         if H < 8 or W < 8:
             water_mask = np.ones((max(1, H), max(1, W)), dtype=bool)
@@ -182,7 +225,7 @@ class MarineVisionEngine:
 
         roll_deg = float(np.rad2deg(np.arctan(slope)))
         horizon_mid_y = float(slope * (W / 2.0) + intercept)
-        pitch_offset_pct = float((0.5 - horizon_mid_y / H) * 100.0)
+        pitch_offset_pct = float(np.clip((0.5 - horizon_mid_y / H) * 100.0, -100.0, 100.0))
 
         yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
         horizon_curve = slope * xx + intercept
@@ -206,14 +249,32 @@ class MarineVisionEngine:
         denom = area_a + area_b - inter_area
         return inter_area / denom if denom > 0.0 else 0.0
 
+    @staticmethod
+    def _compute_containment(box_a: List[int], box_b: List[int]) -> float:
+        """Compute Intersection-over-Minimum-Area (IoMin) to detect nested/occluded sub-boxes."""
+        ix1 = max(box_a[0], box_b[0])
+        iy1 = max(box_a[1], box_b[1])
+        ix2 = min(box_a[2], box_b[2])
+        iy2 = min(box_a[3], box_b[3])
+        inter_w = max(0, ix2 - ix1)
+        inter_h = max(0, iy2 - iy1)
+        inter_area = float(inter_w * inter_h)
+        if inter_area <= 0.0:
+            return 0.0
+        area_a = float(max(0, box_a[2] - box_a[0]) * max(0, box_a[3] - box_a[1]))
+        area_b = float(max(0, box_b[2] - box_b[0]) * max(0, box_b[3] - box_b[1]))
+        min_area = min(area_a, area_b)
+        return inter_area / min_area if min_area > 0.0 else 0.0
+
     @classmethod
     def _deduplicate_ensemble_boxes(
         cls,
         candidates: List[Dict[str, Any]],
         same_class_iou: float = 0.45,
         cross_class_iou: float = 0.60,
+        containment_iou: float = 0.70,
     ) -> List[Dict[str, Any]]:
-        """Apply Cross-Model Non-Maximum Suppression (NMS) across ensemble detections."""
+        """Apply Cross-Model Non-Maximum Suppression (NMS) and containment filtering across detections."""
         sorted_cands = sorted(candidates, key=lambda d: d["confidence"], reverse=True)
         kept: List[Dict[str, Any]] = []
         for cand in sorted_cands:
@@ -221,7 +282,7 @@ class MarineVisionEngine:
             for existing in kept:
                 iou = cls._compute_iou(cand["bbox"], existing["bbox"])
                 thresh = same_class_iou if cand["class_name"] == existing["class_name"] else cross_class_iou
-                if iou >= thresh:
+                if iou >= thresh or cls._compute_containment(cand["bbox"], existing["bbox"]) >= containment_iou:
                     duplicate = True
                     break
             if not duplicate:
@@ -236,26 +297,27 @@ class MarineVisionEngine:
         conf_threshold: float,
         source_model: str,
     ) -> List[Dict[str, Any]]:
-        """Run a single YOLOv11m model and extract standardized candidate boxes."""
-        model = self._get_yolo(weight_file)
-        results = model.predict(pil_img, imgsz=imgsz, conf=conf_threshold, verbose=False)
-        pred = results[0]
-        raw_boxes: List[Dict[str, Any]] = []
-        for box in pred.boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            cls_name = pred.names.get(cls_id, f"Class {cls_id}")
-            if weight_file == "yolo11m_ks_buoy.pt":
-                cls_name = "Navigation Buoy"
-            raw_boxes.append({
-                "class_id": cls_id,
-                "class_name": cls_name,
-                "confidence": conf,
-                "bbox": [x1, y1, x2, y2],
-                "source_model": source_model,
-            })
-        return raw_boxes
+        """Run a single YOLOv11m model thread-safely and extract standardized candidate boxes."""
+        with self._lock:
+            model = self._get_yolo(weight_file)
+            results = model.predict(pil_img, imgsz=imgsz, conf=conf_threshold, verbose=False)
+            pred = results[0]
+            raw_boxes: List[Dict[str, Any]] = []
+            for box in pred.boxes:
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                cls_name = pred.names.get(cls_id, f"Class {cls_id}")
+                if weight_file == "yolo11m_ks_buoy.pt":
+                    cls_name = "Navigation Buoy"
+                raw_boxes.append({
+                    "class_id": cls_id,
+                    "class_name": cls_name,
+                    "confidence": conf,
+                    "bbox": [x1, y1, x2, y2],
+                    "source_model": source_model,
+                })
+            return raw_boxes
 
     def run_detection(
         self,
@@ -280,15 +342,8 @@ class MarineVisionEngine:
         hfov_deg = float(np.clip(float(hfov_deg), 10.0, 179.0))
 
         t0 = time.perf_counter()
-        try:
-            pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
-            raise ValueError(f"Invalid or corrupted image file: {exc}") from exc
-
-        rgb = np.array(pil_img)
+        pil_img, rgb = self._decode_rgb_image(image_bytes)
         H, W, _ = rgb.shape
-        if H < 8 or W < 8:
-            raise ValueError(f"Image dimensions ({W}x{H}) are too small; minimum supported size is 8x8 pixels.")
 
         slope, intercept, roll_deg, pitch_offset_pct, water_mask = self.estimate_horizon(rgb)
         water_ratio = float(water_mask.mean() * 100.0)
@@ -297,34 +352,60 @@ class MarineVisionEngine:
         # Collect detections from either the 3-model ensemble ("all") or the selected specialist model
         if mode_clean == "all":
             ensemble_plan = [
-                ("buoy", "yolo11m_ks_buoy.pt", 960),
-                ("colregs", "yolo11m_spscd_vessels.pt", 960),
-                ("sar", "yolo11m_afo_sar.pt", 960),
+                ("buoy", "yolo11m_ks_buoy.pt", MODEL_SPECS["buoy"]["imgsz"]),
+                ("colregs", "yolo11m_spscd_vessels.pt", MODEL_SPECS["colregs"]["imgsz"]),
+                ("sar", "yolo11m_afo_sar.pt", MODEL_SPECS["sar"]["imgsz"]),
             ]
-            raw_candidates: List[Dict[str, Any]] = []
+            by_sub: Dict[str, List[Dict[str, Any]]] = {}
             for sub_mode, w_file, imgsz in ensemble_plan:
-                raw_candidates.extend(
-                    self._collect_single_model_boxes(
-                        pil_img=pil_img,
-                        weight_file=w_file,
-                        imgsz=imgsz,
-                        conf_threshold=conf_threshold,
-                        source_model=sub_mode,
-                    )
+                by_sub[sub_mode] = self._collect_single_model_boxes(
+                    pil_img=pil_img,
+                    weight_file=w_file,
+                    imgsz=imgsz,
+                    conf_threshold=conf_threshold,
+                    source_model=sub_mode,
                 )
+
+            sky_luma = float(rgb[~water_mask].mean()) if (~water_mask).any() else 0.0
+            water_luma = float(rgb[water_mask].mean()) if water_mask.any() else 0.0
+            has_bright_sky_horizon = (sky_luma - water_luma) >= 25.0
+            has_surface_craft_or_buoy = len(by_sub["buoy"]) > 0 or len(by_sub["colregs"]) > 0
+            max_sar_conf = max((b["confidence"] for b in by_sub["sar"]), default=0.0)
+
+            filtered_sar: List[Dict[str, Any]] = []
+            for sb in by_sub["sar"]:
+                sx1, sy1, sx2, sy2 = sb["bbox"]
+                sxc = 0.5 * (sx1 + sx2)
+                hor_y = slope * sxc + intercept
+                if has_bright_sky_horizon:
+                    # Reject aerial SAR false positives above the sea-sky horizon or low-conf whitecaps on surface scenes
+                    if sy1 < hor_y - 4.0:
+                        continue
+                    if has_surface_craft_or_buoy and sb["confidence"] < max(0.55, conf_threshold):
+                        continue
+                filtered_sar.append(sb)
+
+            filtered_colregs: List[Dict[str, Any]] = []
+            for cb in by_sub["colregs"]:
+                if not has_bright_sky_horizon and max_sar_conf >= 0.50 and cb["confidence"] < 0.50:
+                    continue
+                filtered_colregs.append(cb)
+
+            raw_candidates = by_sub["buoy"] + filtered_colregs + filtered_sar
             merged_boxes = self._deduplicate_ensemble_boxes(raw_candidates)
             active_models = ["yolo11m_ks_buoy.pt", "yolo11m_spscd_vessels.pt", "yolo11m_afo_sar.pt"]
         else:
             weight_file = spec["weights"]
             if mode_clean == "horizon" and source_hint and str(source_hint).startswith("buoy/"):
                 weight_file = "yolo11m_ks_buoy.pt"
-            merged_boxes = self._collect_single_model_boxes(
+            raw_single = self._collect_single_model_boxes(
                 pil_img=pil_img,
                 weight_file=weight_file,
                 imgsz=spec["imgsz"],
                 conf_threshold=conf_threshold,
                 source_model=mode_clean,
             )
+            merged_boxes = self._deduplicate_ensemble_boxes(raw_single)
             active_models = [weight_file]
 
         # Render overlay
@@ -337,7 +418,11 @@ class MarineVisionEngine:
 
         detections: List[Dict[str, Any]] = []
         for idx, item in enumerate(merged_boxes, 1):
-            x1, y1, x2, y2 = item["bbox"]
+            raw_x1, raw_y1, raw_x2, raw_y2 = item["bbox"]
+            x1 = int(np.clip(min(raw_x1, raw_x2), 0, W - 1))
+            y1 = int(np.clip(min(raw_y1, raw_y2), 0, H - 1))
+            x2 = int(np.clip(max(raw_x1, raw_x2), x1, W - 1))
+            y2 = int(np.clip(max(raw_y1, raw_y2), y1, H - 1))
             cls_id = int(item["class_id"])
             conf = float(item["confidence"])
             cls_name = str(item["class_name"])
@@ -345,8 +430,8 @@ class MarineVisionEngine:
             if mode_clean in ("horizon", "all"):
                 box_alpha = 0.55 if mode_clean == "horizon" else 0.28
                 tint = np.array([239, 68, 68]) if mode_clean == "horizon" else np.array(CLASS_COLORS.get(cls_name, (239, 68, 68)))
-                overlay[max(0, y1) : min(H, y2), max(0, x1) : min(W, x2)] = (
-                    (1.0 - box_alpha) * rgb[max(0, y1) : min(H, y2), max(0, x1) : min(W, x2)]
+                overlay[y1:y2, x1:x2] = (
+                    (1.0 - box_alpha) * rgb[y1:y2, x1:x2]
                     + box_alpha * tint
                 )
 
@@ -381,8 +466,8 @@ class MarineVisionEngine:
 
         # Draw horizon line in horizon, buoy, colregs, or all mode
         if mode_clean in ("horizon", "buoy", "colregs", "all"):
-            y0 = int(intercept)
-            y1_end = int(slope * (W - 1) + intercept)
+            y0 = int(np.clip(round(intercept), -H * 4, H * 5))
+            y1_end = int(np.clip(round(slope * (W - 1) + intercept), -H * 4, H * 5))
             draw.line([(0, y0), (W - 1, y1_end)], fill=(250, 204, 21), width=3)
 
         # Draw bounding boxes & bearing/risk tags
@@ -399,15 +484,18 @@ class MarineVisionEngine:
                 color = (239, 68, 68)
             else:
                 color = CLASS_COLORS.get(det["class_name"], palette[det["class_id"] % len(palette)])
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+            draw.rectangle([x1, y1, max(x1, x2), max(y1, y2)], outline=color, width=3)
             label = (
                 f"{det['class_name']} {det['confidence_pct']:.0f}% | "
                 f"{det['bearing_deg']:+.1f}° | {det.get('risk_level', 'NOMINAL')}"
             )
             tw = max(110, len(label) * 6 + 10)
-            ty = max(0, y1 - 20)
-            draw.rectangle([x1, ty, min(W, x1 + tw), ty + 20], fill=color)
-            draw.text((x1 + 5, ty + 3), label, fill=(255, 255, 255))
+            lx1 = max(0, min(x1, W - 1))
+            lx2 = max(lx1, min(W, lx1 + tw))
+            ly1 = max(0, min(y1 - 20, H - 1))
+            ly2 = max(ly1, min(H, ly1 + 20))
+            draw.rectangle([lx1, ly1, lx2, ly2], fill=color)
+            draw.text((lx1 + 5, ly1 + 3), label, fill=(255, 255, 255))
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         buf = io.BytesIO()

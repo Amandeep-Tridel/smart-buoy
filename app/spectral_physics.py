@@ -51,14 +51,14 @@ BEAUFORT_WIND_TABLE: List[Tuple[int, float, str, str, str]] = [
 
 
 def _sanitize_non_negative(value: Optional[float], default: float = 0.0) -> float:
-    """Convert value to a finite non-negative float, handling None, NaN, and negative values."""
+    """Convert value to a finite non-negative float, handling None, NaN, inf, and negative values."""
     if value is None:
         return default
     try:
         val = float(value)
     except (TypeError, ValueError):
         return default
-    if math.isnan(val) or val < 0.0:
+    if not math.isfinite(val) or val < 0.0:
         return default
     return val
 
@@ -75,15 +75,15 @@ def classify_wmo_sea_state(hs_m: Optional[float]) -> Dict[str, Any]:
 
     if math.isnan(raw_val) or raw_val <= 0.0:
         code, _, label, range_str, severity = WMO_SEA_STATE_TABLE[0]
-        clean_hs = 0.0
+        clean_hs: Optional[float] = 0.0
     elif math.isinf(raw_val):
         code, _, label, range_str, severity = WMO_SEA_STATE_TABLE[-1]
-        clean_hs = raw_val
+        clean_hs = None
     else:
-        clean_hs = raw_val
+        clean_hs = round(raw_val, 3)
         code, _, label, range_str, severity = WMO_SEA_STATE_TABLE[-1]
         for c, upper, lbl, rng, sev in WMO_SEA_STATE_TABLE:
-            if clean_hs <= upper:
+            if raw_val <= upper:
                 code, label, range_str, severity = c, lbl, rng, sev
                 break
 
@@ -92,7 +92,7 @@ def classify_wmo_sea_state(hs_m: Optional[float]) -> Dict[str, Any]:
         "label": label,
         "range_m": range_str,
         "severity": severity,
-        "hs_m": round(clean_hs, 3) if math.isfinite(clean_hs) else clean_hs,
+        "hs_m": clean_hs,
         "description": f"WMO Sea State {code}: {label} ({range_str})",
     }
 
@@ -125,10 +125,34 @@ def classify_beaufort_wind(wspd_mps: Optional[float]) -> Dict[str, Any]:
         "label": label,
         "range_mps": range_mps,
         "advisory": advisory,
-        "wspd_mps": round(clean_u, 2) if math.isfinite(clean_u) else clean_u,
-        "wspd_knots": round(knots, 2) if math.isfinite(knots) else knots,
+        "wspd_mps": round(clean_u, 2) if math.isfinite(clean_u) else None,
+        "wspd_knots": round(knots, 2) if math.isfinite(knots) else None,
         "description": f"Beaufort Force {force}: {label} ({range_mps})",
     }
+
+
+def _solve_finite_depth_wavenumber(tp_s: float, depth_m: float, g: float = GRAVITY_MPS2) -> float:
+    """Solve linear dispersion omega^2 = g * k * tanh(k * d) for wavenumber k (rad/m) via Newton-Raphson."""
+    if tp_s <= 0.0 or depth_m <= 0.0 or not math.isfinite(tp_s) or not math.isfinite(depth_m):
+        return 0.0
+    omega = (2.0 * math.pi) / tp_s
+    k0 = (omega ** 2) / g
+    kd0 = k0 * depth_m
+    if kd0 >= 10.0:
+        return k0
+    # Fenton & McKee (1990) explicit starting approximation
+    tanh_arg = min(20.0, kd0 ** 0.75)
+    k = k0 * (math.tanh(tanh_arg) ** (-2.0 / 3.0))
+    for _ in range(5):
+        kd = min(50.0, k * depth_m)
+        th = math.tanh(kd)
+        ch2 = math.cosh(kd) ** 2
+        f_val = g * k * th - (omega ** 2)
+        df_val = g * (th + kd / ch2)
+        if abs(df_val) < 1e-15:
+            break
+        k = max(k0, k - f_val / df_val)
+    return float(k)
 
 
 def compute_wave_steepness(
@@ -136,19 +160,28 @@ def compute_wave_steepness(
     tp_s: Optional[float],
     tm02_s: Optional[float] = None,
     g: float = GRAVITY_MPS2,
+    depth_m: float = 130.0,
 ) -> Dict[str, Any]:
-    """Compute significant wave steepness S_p = 2*pi*H_m0 / (g * T_p^2) and deep-water dispersion metrics."""
+    """Compute significant wave steepness S_p = 2*pi*H_m0 / (g * T_p^2) and dispersion kinematics."""
     hs = _sanitize_non_negative(hm0_m, 0.0)
     tp = _sanitize_non_negative(tp_s, 0.0)
     tm02 = _sanitize_non_negative(tm02_s, 0.0)
-    g_val = g if (g is not None and math.isfinite(g) and g > 0.0) else GRAVITY_MPS2
+    g_val = float(g) if (g is not None and math.isfinite(g) and g > 0.0) else GRAVITY_MPS2
+    d_val = _sanitize_non_negative(depth_m, 130.0)
+    if d_val <= 0.0:
+        d_val = 130.0
 
-    if hs <= 0.0 or tp <= 0.0 or not math.isfinite(hs) or not math.isfinite(tp):
+    if hs <= 0.0 or tp <= 0.0:
         sp = 0.0
         wavelength_p = 0.0
         wavenumber_kp = 0.0
         phase_speed_cp = 0.0
         group_speed_cg = 0.0
+        kp_finite = 0.0
+        wavelength_finite = 0.0
+        sp_finite = 0.0
+        kd_rel = 0.0
+        disp_regime = "Calm / Flat"
     else:
         wavelength_p = (g_val * (tp ** 2)) / (2.0 * math.pi)
         sp = (2.0 * math.pi * hs) / (g_val * (tp ** 2))
@@ -156,7 +189,18 @@ def compute_wave_steepness(
         phase_speed_cp = (g_val * tp) / (2.0 * math.pi)
         group_speed_cg = 0.5 * phase_speed_cp
 
-    if hs <= 0.0 or tm02 <= 0.0 or not math.isfinite(hs) or not math.isfinite(tm02):
+        kp_finite = _solve_finite_depth_wavenumber(tp, d_val, g_val)
+        wavelength_finite = (2.0 * math.pi) / kp_finite if kp_finite > 0.0 else wavelength_p
+        sp_finite = hs / wavelength_finite if wavelength_finite > 0.0 else sp
+        kd_rel = kp_finite * d_val
+        if kd_rel >= math.pi:
+            disp_regime = "Deep water (kd >= pi)"
+        elif kd_rel > math.pi / 10.0:
+            disp_regime = "Intermediate water (pi/10 < kd < pi)"
+        else:
+            disp_regime = "Shallow water (kd <= pi/10)"
+
+    if hs <= 0.0 or tm02 <= 0.0:
         sm02 = round(sp, 5)
     else:
         sm02 = (2.0 * math.pi * hs) / (g_val * (tm02 ** 2))
@@ -185,6 +229,11 @@ def compute_wave_steepness(
         "wavenumber_kp_rad_m": round(float(wavenumber_kp), 5),
         "phase_speed_cp_mps": round(float(phase_speed_cp), 2),
         "group_speed_cg_mps": round(float(group_speed_cg), 2),
+        "finite_depth_wavelength_m": round(float(wavelength_finite), 2),
+        "finite_depth_kp_rad_m": round(float(kp_finite), 5),
+        "finite_depth_steepness_sp": round(float(sp_finite), 5),
+        "relative_depth_kd": round(float(kd_rel), 3),
+        "dispersion_regime": disp_regime,
         "stokes_breaking_limit": round(stokes_limit, 5),
         "breaking_proximity_pct": round(float(breaking_fraction * 100.0), 2),
         "regime": regime,
@@ -193,8 +242,11 @@ def compute_wave_steepness(
 
 def compute_goda_peakedness(freqs: np.ndarray, spectrum: np.ndarray) -> float:
     """Compute Goda's spectral peakedness factor Q_p = (2 / m_0^2) * integral(f * S(f)^2 df)."""
-    f = np.asarray(freqs, dtype=np.float64)
-    s = np.maximum(np.asarray(spectrum, dtype=np.float64), 0.0)
+    f = np.nan_to_num(np.asarray(freqs, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    s = np.maximum(
+        np.nan_to_num(np.asarray(spectrum, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    )
     if f.ndim != 1 or s.ndim != 1 or len(f) < 2 or len(f) != len(s):
         return 2.0
     trapz_fn = getattr(np, "trapezoid", getattr(np, "trapz", None))
@@ -202,7 +254,11 @@ def compute_goda_peakedness(freqs: np.ndarray, spectrum: np.ndarray) -> float:
     if m0 <= 1e-12 or not math.isfinite(m0):
         return 2.0
     num = float(trapz_fn(f * (s ** 2), f))
+    if not math.isfinite(num) or num <= 0.0:
+        return 2.0
     qp = (2.0 * num) / (m0 ** 2)
+    if not math.isfinite(qp):
+        return 2.0
     return float(np.clip(qp, 1.0, 12.0))
 
 
@@ -213,7 +269,7 @@ def compute_rogue_wave_risk(
     bandwidth_eps: Optional[float] = None,
     freqs: Optional[np.ndarray] = None,
     spectrum: Optional[np.ndarray] = None,
-    duration_s: float = 10800.0,
+    duration_s: Optional[float] = 10800.0,
 ) -> Dict[str, Any]:
     """Compute Rogue Wave Crest Risk Index using Tayfun second-order crest statistics and Benjamin-Feir Index."""
     hs = _sanitize_non_negative(hm0_m, 0.0)
@@ -222,8 +278,11 @@ def compute_rogue_wave_risk(
     eps = _sanitize_non_negative(bandwidth_eps, 0.55)
     if eps <= 0.0:
         eps = 0.55
+    dur = _sanitize_non_negative(duration_s, 10800.0)
+    if dur <= 0.0:
+        dur = 10800.0
 
-    if hs <= 0.0 or tp <= 0.0 or not math.isfinite(hs) or not math.isfinite(tp):
+    if hs <= 0.0 or tp <= 0.0:
         return {
             "risk_index": 0.0,
             "risk_score": 0.0,
@@ -251,13 +310,15 @@ def compute_rogue_wave_risk(
         # Estimate peakedness from spectral bandwidth parameter eps
         qp = float(np.clip(2.0 / max(eps, 0.25), 1.2, 8.0))
 
+    # Bound effective steepness in BFI by Miche/Stokes wave-breaking limit (1/7)
+    sp_phys = min(sp, 1.0 / 7.0)
     # Benjamin-Feir Index (BFI): ratio of steepness to relative spectral width (Janssen 2003)
-    bfi = float(math.pi * math.sqrt(math.pi) * sp * qp)
+    bfi = float(min(4.0, math.pi * math.sqrt(math.pi) * sp_phys * qp))
     # Excess fourth-order cumulant (kurtosis) from four-wave quasi-resonant interactions
     kurtosis_excess = float((math.pi / math.sqrt(3.0)) * (bfi ** 2))
 
     eff_tm02 = tm02 if tm02 > 0.5 else max(tp * 0.78, 1.0)
-    n_waves = max(1.0, float(duration_s) / eff_tm02)
+    n_waves = float(np.clip(dur / eff_tm02, 1.0, 1e7))
     ln_n = max(math.log(n_waves), 1.0)
 
     # Longuet-Higgins expected maximum wave height in duration_s (with kurtosis nonlinear correction)
@@ -266,8 +327,10 @@ def compute_rogue_wave_risk(
     expected_hmax = hs * rayleigh_factor * nonlinear_h_boost
 
     # Tayfun second-order nonlinear maximum crest elevation: eta_c = 0.5 * H_max * (1 + 0.5 * k_p * H_max)
+    # Second-order Stokes steepness nonlinearity 0.5 * k_p * H_max is bounded by the Stokes breaking limit pi/7 (~0.4488)
     linear_crest = 0.5 * expected_hmax
-    expected_crest_max = linear_crest * (1.0 + 0.5 * kp * expected_hmax)
+    stokes_nonlin = min(0.5 * kp * expected_hmax, math.pi / 7.0)
+    expected_crest_max = linear_crest * (1.0 + stokes_nonlin)
 
     crest_ratio = expected_crest_max / hs
     hmax_ratio = expected_hmax / hs
@@ -329,7 +392,7 @@ def pierson_moskowitz_spectrum(f: np.ndarray, hs: float, tp: float) -> np.ndarra
     out = np.zeros_like(f_arr, dtype=np.float64)
     hs_val = _sanitize_non_negative(hs, 0.0)
     tp_val = _sanitize_non_negative(tp, 0.0)
-    if hs_val <= 0.0 or tp_val <= 0.0 or not math.isfinite(hs_val) or not math.isfinite(tp_val):
+    if hs_val <= 0.0 or tp_val <= 0.0:
         return out
 
     fp = 1.0 / max(tp_val, 1e-4)
@@ -365,18 +428,53 @@ def jonswap_spectrum(f: np.ndarray, hs: float, tp: float, gamma: float = 3.3) ->
     return np.where(np.isfinite(s_j), np.maximum(s_j, 0.0), 0.0)
 
 
+def _detect_spectral_peaks(f_arr: np.ndarray, s_meas: np.ndarray) -> Tuple[int, Optional[float]]:
+    """Detect significant spectral peaks (>=15% of main peak, separated by >=2 bins) for bimodal sea analysis."""
+    n = len(s_meas)
+    if n < 3:
+        return (1 if n > 0 and float(np.max(s_meas)) > 1e-6 else 0), None
+    s_max = float(np.max(s_meas))
+    if s_max <= 1e-6:
+        return 0, None
+
+    peak_indices: List[int] = []
+    for i in range(1, n - 1):
+        if s_meas[i] >= 0.15 * s_max and s_meas[i] > s_meas[i - 1] and s_meas[i] >= s_meas[i + 1]:
+            if not peak_indices or (i - peak_indices[-1]) >= 2:
+                peak_indices.append(i)
+            elif s_meas[i] > s_meas[peak_indices[-1]]:
+                peak_indices[-1] = i
+
+    if not peak_indices:
+        return 1, None
+
+    peak_indices.sort(key=lambda idx: float(s_meas[idx]), reverse=True)
+    secondary_tp: Optional[float] = None
+    if len(peak_indices) >= 2:
+        sec_f = float(f_arr[peak_indices[1]])
+        if sec_f > 1e-6:
+            secondary_tp = round(1.0 / sec_f, 2)
+    return len(peak_indices), secondary_tp
+
+
 def compare_pm_vs_jonswap(
     f: np.ndarray,
     s_measured: np.ndarray,
-    hs: float,
-    tp: float,
+    hs: Optional[float],
+    tp: Optional[float],
     gamma: float = 3.3,
 ) -> Dict[str, Any]:
     """Compare measured buoy wave spectrum S(f) against Pierson-Moskowitz (fully developed) and JONSWAP models."""
-    f_arr = np.asarray(f, dtype=np.float64)
-    s_meas = np.maximum(np.asarray(s_measured, dtype=np.float64), 0.0)
-    s_pm = pierson_moskowitz_spectrum(f_arr, hs, tp)
-    s_js = jonswap_spectrum(f_arr, hs, tp, gamma=gamma)
+    f_arr = np.nan_to_num(np.asarray(f, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    s_meas = np.maximum(
+        np.nan_to_num(np.asarray(s_measured, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    )
+    hs_val = _sanitize_non_negative(hs, 0.0)
+    tp_val = _sanitize_non_negative(tp, 0.0)
+
+    s_pm = pierson_moskowitz_spectrum(f_arr, hs_val, tp_val)
+    s_js = jonswap_spectrum(f_arr, hs_val, tp_val, gamma=gamma)
 
     if len(f_arr) == 0 or len(s_meas) != len(f_arr):
         return {
@@ -386,6 +484,7 @@ def compare_pm_vs_jonswap(
             "jonswap_mae_m2_hz": 0.0,
             "pm_r2": 0.0,
             "jonswap_r2": 0.0,
+            "fitted_jonswap_r2": 0.0,
             "pm_corr_r": 0.0,
             "jonswap_corr_r": 0.0,
             "measured_peak_m2_hz": 0.0,
@@ -396,8 +495,12 @@ def compare_pm_vs_jonswap(
             "fitted_jonswap_rmse_m2_hz": 0.0,
             "best_fit_model": "JONSWAP",
             "sea_development_stage": "Calm / Flat",
+            "is_bimodal": False,
+            "num_spectral_peaks": 0,
+            "secondary_peak_tp_s": None,
             "pierson_moskowitz_m2_hz": [],
             "jonswap_m2_hz": [],
+            "fitted_jonswap_m2_hz": [],
         }
 
     pm_rmse = float(np.sqrt(np.mean((s_meas - s_pm) ** 2)))
@@ -431,20 +534,26 @@ def compare_pm_vs_jonswap(
     gamma_grid = np.linspace(1.0, 7.0, 61)
     best_gamma = 1.0
     best_rmse = pm_rmse
-    if meas_peak > 1e-6 and hs > 0.0 and tp > 0.0:
+    if meas_peak > 1e-6 and hs_val > 0.0 and tp_val > 0.0:
         for g_cand in gamma_grid:
-            s_cand = jonswap_spectrum(f_arr, hs, tp, gamma=float(g_cand))
+            s_cand = jonswap_spectrum(f_arr, hs_val, tp_val, gamma=float(g_cand))
             cand_rmse = float(np.sqrt(np.mean((s_meas - s_cand) ** 2)))
             if cand_rmse < best_rmse:
                 best_rmse = cand_rmse
                 best_gamma = float(g_cand)
 
-    best_model = "JONSWAP" if js_rmse <= pm_rmse else "Pierson-Moskowitz"
-    if meas_peak <= 1e-6 or hs <= 0.0:
+    s_fitted = jonswap_spectrum(f_arr, hs_val, tp_val, gamma=best_gamma)
+    fitted_r2 = float(1.0 - np.sum((s_meas - s_fitted) ** 2) / ss_tot) if ss_tot > 1e-12 else 0.0
+    num_peaks, sec_tp = _detect_spectral_peaks(f_arr, s_meas)
+
+    if meas_peak <= 1e-6 or hs_val <= 0.0 or tp_val <= 0.0:
+        best_model = "JONSWAP" if js_rmse <= pm_rmse else "Pierson-Moskowitz"
         stage = "Calm / Flat"
-    elif best_gamma >= 1.8 or best_model == "JONSWAP":
+    elif best_gamma >= 1.5 or js_rmse <= pm_rmse:
+        best_model = "JONSWAP"
         stage = "Fetch-limited / Developing Sea (JONSWAP)"
     else:
+        best_model = "Pierson-Moskowitz"
         stage = "Fully Developed Sea (Pierson-Moskowitz)"
 
     return {
@@ -454,6 +563,7 @@ def compare_pm_vs_jonswap(
         "jonswap_mae_m2_hz": round(js_mae, 4),
         "pm_r2": round(pm_r2, 4),
         "jonswap_r2": round(js_r2, 4),
+        "fitted_jonswap_r2": round(fitted_r2, 4),
         "pm_corr_r": round(pm_corr, 4),
         "jonswap_corr_r": round(js_corr, 4),
         "measured_peak_m2_hz": round(meas_peak, 4),
@@ -464,6 +574,11 @@ def compare_pm_vs_jonswap(
         "fitted_jonswap_rmse_m2_hz": round(best_rmse, 4),
         "best_fit_model": best_model,
         "sea_development_stage": stage,
+        "is_bimodal": bool(num_peaks >= 2),
+        "num_spectral_peaks": int(num_peaks),
+        "secondary_peak_tp_s": sec_tp,
         "pierson_moskowitz_m2_hz": [round(float(x), 4) for x in s_pm],
         "jonswap_m2_hz": [round(float(x), 4) for x in s_js],
+        "fitted_jonswap_m2_hz": [round(float(x), 4) for x in s_fitted],
     }
+

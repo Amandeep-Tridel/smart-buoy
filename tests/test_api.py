@@ -1,8 +1,10 @@
 """End-to-end integration tests for FastAPI REST and WebSocket endpoints in app/main.py."""
 
+import io
 from unittest.mock import patch
 import urllib.error
 from fastapi.testclient import TestClient
+from PIL import Image
 import pytest
 
 from app.main import app
@@ -96,11 +98,11 @@ def test_api_vision_samples(client: TestClient) -> None:
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["samples"]) >= 12
-    assert set(data["modes"].keys()) == {"buoy", "colregs", "sar", "horizon"}
+    assert {"buoy", "colregs", "sar", "horizon"}.issubset(set(data["modes"].keys()))
 
 
 def test_api_vision_detect_sample_and_security(client: TestClient) -> None:
-    """Verify POST /api/vision/detect-sample runs YOLOv11m and blocks path traversal / missing files."""
+    """Verify POST /api/vision/detect-sample runs YOLOv11m and blocks path traversal / missing files / bad params."""
     resp = client.post(
         "/api/vision/detect-sample",
         json={"sample_id": "buoy/buoy_sample_1_buoy_00022.png", "mode": "buoy", "conf": 0.25},
@@ -126,9 +128,36 @@ def test_api_vision_detect_sample_and_security(client: TestClient) -> None:
     )
     assert resp_traversal.status_code == 404
 
+    # Directory path instead of file -> 404
+    resp_dir = client.post(
+        "/api/vision/detect-sample",
+        json={"sample_id": "buoy", "mode": "buoy", "conf": 0.25},
+    )
+    assert resp_dir.status_code == 404
 
-def test_api_vision_detect_upload_and_empty_error(client: TestClient) -> None:
-    """Verify POST /api/vision/detect-upload handles multipart image upload and rejects empty files."""
+    # Whitespace-only sample_id -> 404
+    resp_ws = client.post(
+        "/api/vision/detect-sample",
+        json={"sample_id": "   ", "mode": "buoy", "conf": 0.25},
+    )
+    assert resp_ws.status_code == 404
+
+    # Invalid mode or out-of-range confidence -> 422
+    resp_bad_mode = client.post(
+        "/api/vision/detect-sample",
+        json={"sample_id": "buoy/buoy_sample_1_buoy_00022.png", "mode": "invalid_mode", "conf": 0.25},
+    )
+    assert resp_bad_mode.status_code == 422
+
+    resp_bad_conf = client.post(
+        "/api/vision/detect-sample",
+        json={"sample_id": "buoy/buoy_sample_1_buoy_00022.png", "mode": "buoy", "conf": 1.5},
+    )
+    assert resp_bad_conf.status_code == 422
+
+
+def test_api_vision_detect_upload_and_error_paths(client: TestClient) -> None:
+    """Verify POST /api/vision/detect-upload handles multipart image upload and rejects invalid inputs."""
     sample_path = SAMPLES_DIR / "sar" / "sar_sample_1_a_1121.jpg"
     img_bytes = sample_path.read_bytes()
 
@@ -152,14 +181,50 @@ def test_api_vision_detect_upload_and_empty_error(client: TestClient) -> None:
     )
     assert resp_empty.status_code == 400
 
+    # Corrupted non-image upload -> 400 Bad Request
+    resp_corrupt = client.post(
+        "/api/vision/detect-upload",
+        data={"mode": "buoy", "conf": "0.25"},
+        files={"file": ("corrupt.jpg", b"not-an-image-stream", "image/jpeg")},
+    )
+    assert resp_corrupt.status_code == 400
 
-def test_websocket_live_buoy_stream(client: TestClient) -> None:
-    """Verify WebSocket /ws/live streams real-time 6-DOF IMU heave/roll/pitch and NOAA telemetry."""
-    with client.websocket_connect("/ws/live") as ws:
-        frame1 = ws.receive_json()
-        frame2 = ws.receive_json()
+    # Tiny (< 8x8) image upload -> 400 Bad Request
+    tiny_img = Image.new("RGB", (4, 4), color=(0, 0, 0))
+    tbuf = io.BytesIO()
+    tiny_img.save(tbuf, format="PNG")
+    resp_tiny = client.post(
+        "/api/vision/detect-upload",
+        data={"mode": "buoy", "conf": "0.25"},
+        files={"file": ("tiny.png", tbuf.getvalue(), "image/png")},
+    )
+    assert resp_tiny.status_code == 400
 
-    for frame in (frame1, frame2):
+    # Unsupported vision mode -> 422 Unprocessable Entity
+    resp_bad_mode = client.post(
+        "/api/vision/detect-upload",
+        data={"mode": "invalid_xyz", "conf": "0.25"},
+        files={"file": ("sar_upload.jpg", img_bytes, "image/jpeg")},
+    )
+    assert resp_bad_mode.status_code == 422
+
+    # Out-of-bounds confidence threshold -> 422 Unprocessable Entity
+    resp_bad_conf = client.post(
+        "/api/vision/detect-upload",
+        data={"mode": "buoy", "conf": "1.50"},
+        files={"file": ("sar_upload.jpg", img_bytes, "image/jpeg")},
+    )
+    assert resp_bad_conf.status_code == 422
+
+
+def test_websocket_live_buoy_stream_and_concurrent_clients(client: TestClient) -> None:
+    """Verify WebSocket /ws/live streams real-time 6-DOF IMU heave/roll/pitch to single and concurrent clients."""
+    with client.websocket_connect("/ws/live") as ws1, client.websocket_connect("/ws/live") as ws2:
+        frame1_a = ws1.receive_json()
+        frame1_b = ws2.receive_json()
+        frame2_a = ws1.receive_json()
+
+    for frame in (frame1_a, frame1_b, frame2_a):
         assert "timestamp" in frame
         assert "imu" in frame and "met" in frame and "wq" in frame
 
@@ -176,3 +241,4 @@ def test_websocket_live_buoy_stream(client: TestClient) -> None:
         wq = frame["wq"]
         assert all(k in wq for k in ("otmp_c", "sal_psu", "o2_ppm", "turb_ntu", "ph"))
         assert 5.0 <= wq["ph"] <= 10.5
+

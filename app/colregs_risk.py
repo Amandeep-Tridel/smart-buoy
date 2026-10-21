@@ -26,11 +26,28 @@ CLOSING_SPEED_MPS: Dict[str, float] = {
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     """Convert value to a finite float or return default."""
+    if isinstance(val, bool):
+        return default
     try:
         f = float(val)
         return f if math.isfinite(f) else default
     except (TypeError, ValueError):
         return default
+
+
+def _safe_range_m(val: Any, default: float = 150.0) -> float:
+    """Convert range value to a bounded distance in [1.0, 2000.0] meters, handling +/-inf."""
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f):
+        return default
+    if math.isinf(f):
+        return 2000.0 if f > 0 else 1.0
+    return max(1.0, min(2000.0, f if f > 0 else 1.0))
 
 
 def normalize_bearing(bearing_deg: Any) -> float:
@@ -39,7 +56,8 @@ def normalize_bearing(bearing_deg: Any) -> float:
     normalized = ((b + 180.0) % 360.0) - 180.0
     if normalized == -180.0 and b > 0:
         return 180.0
-    return round(normalized, 2)
+    res = round(normalized, 2)
+    return 0.0 if abs(res) == 0.0 else res
 
 
 def classify_bearing_sector(bearing_deg: Any) -> str:
@@ -112,8 +130,7 @@ def evaluate_target_risk(
     b_deg = normalize_bearing(bearing_deg)
     sector = classify_bearing_sector(b_deg)
 
-    raw_range = _safe_float(est_range_m, 150.0)
-    range_m = max(1.0, min(2000.0, raw_range if raw_range > 0 else 1.0))
+    range_m = _safe_range_m(est_range_m, 150.0)
 
     raw_conf = _safe_float(confidence, 1.0)
     if raw_conf > 1.0:
@@ -135,11 +152,11 @@ def evaluate_target_risk(
 
     if abs_b <= 6.0:
         bearing_weight = 1.00  # Dead ahead
-    elif 6.0 < b_deg <= 25.0:
+    elif 6.0 < b_deg <= 22.5:
         bearing_weight = 0.94  # Starboard bow give-way zone
-    elif -25.0 <= b_deg < -6.0:
+    elif -22.5 <= b_deg < -6.0:
         bearing_weight = 0.84  # Port bow stand-on zone
-    elif b_deg > 25.0:
+    elif b_deg > 22.5:
         bearing_weight = 0.72  # Starboard beam/quarter
     else:
         bearing_weight = 0.65  # Port beam/quarter
@@ -275,14 +292,28 @@ def evaluate_frame_risk(
     sar_targets_count = 0
     collision_watch_count = 0
     highest_target: Optional[Dict[str, Any]] = None
+    best_priority_key: Optional[ Any ] = None
     max_risk_score = 0.0
 
+    sar_rank_map = {"P1_IMMEDIATE_RESCUE": 2, "P2_ACTIVE_ASSIST": 1, "NONE": 0}
+
     for det in detections:
+        raw_bearing = det.get("bearing_deg", 0.0)
+        raw_range = det.get("est_range_m", 150.0)
+        raw_conf = det.get("confidence", det.get("confidence_pct", 1.0))
+
+        norm_b = normalize_bearing(raw_bearing)
+        safe_r = round(_safe_range_m(raw_range, 150.0), 1)
+        if det.get("bearing_deg") is None:
+            det["bearing_deg"] = norm_b
+        if det.get("est_range_m") is None:
+            det["est_range_m"] = safe_r
+
         eval_res = evaluate_target_risk(
             class_name=det.get("class_name"),
-            bearing_deg=det.get("bearing_deg", 0.0),
-            est_range_m=det.get("est_range_m", 150.0),
-            confidence=det.get("confidence", 1.0),
+            bearing_deg=raw_bearing,
+            est_range_m=raw_range,
+            confidence=raw_conf,
         )
         det.update(eval_res)
 
@@ -298,14 +329,23 @@ def evaluate_frame_risk(
         if lvl in ("CRITICAL", "WARNING"):
             collision_watch_count += 1
 
-        if highest_target is None or score > max_risk_score:
+        if score > max_risk_score:
             max_risk_score = score
+
+        cand_key = (
+            score,
+            sar_rank_map.get(eval_res["sar_priority"], 0),
+            -safe_r,
+            -abs(norm_b),
+        )
+        if highest_target is None or best_priority_key is None or cand_key > best_priority_key:
+            best_priority_key = cand_key
             highest_target = {
                 "id": det.get("id"),
                 "class_name": det.get("class_name"),
                 "category": eval_res["category"],
-                "bearing_deg": det.get("bearing_deg"),
-                "est_range_m": det.get("est_range_m"),
+                "bearing_deg": det.get("bearing_deg", norm_b),
+                "est_range_m": det.get("est_range_m", safe_r),
                 "sector": sec,
                 "risk_score": score,
                 "risk_level": lvl,
@@ -335,16 +375,16 @@ def evaluate_frame_risk(
         overall_status = "NOMINAL"
         advisory = f"{len(detections)} target(s) tracked at safe range. Continue routine radar/optical watch."
 
-    r_deg = abs(_safe_float(roll_deg, 0.0))
-    p_pct = abs(_safe_float(pitch_offset_pct, 0.0))
-    if r_deg > 8.0 or p_pct > 15.0:
+    r_val = _safe_float(roll_deg, 0.0)
+    p_val = _safe_float(pitch_offset_pct, 0.0)
+    if abs(r_val) > 8.0 or abs(p_val) > 15.0:
         sea_state_note = (
-            f"Elevated platform motion (Roll {roll_deg:+.1f}°, Pitch {pitch_offset_pct:+.1f}%): "
+            f"Elevated platform motion (Roll {r_val:+.1f}°, Pitch {p_val:+.1f}%): "
             "apply horizon-stabilized bearing compensation."
         )
     else:
         sea_state_note = (
-            f"Optical horizon stable (Roll {roll_deg:+.1f}°, Pitch {pitch_offset_pct:+.1f}%)."
+            f"Optical horizon stable (Roll {r_val:+.1f}°, Pitch {p_val:+.1f}%)."
         )
 
     return {
